@@ -1,0 +1,5 @@
+comment = 'pgmumbo:  Created by pgrx'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pgmumbo'
+relocatable = false
+superuser = true
