@@ -1,19 +1,26 @@
-use std::{ffi::{CStr, CString, OsStr, OsString}, fmt::format, mem::size_of, path::Path, str::FromStr};
+use std::{
+    ffi::{CStr, CString, OsStr, OsString},
+    fmt::format,
+    mem::size_of,
+    path::Path,
+    str::FromStr,
+};
 
+use pg_sys::panic::ErrorReportable;
 use pgrx::{prelude::*, set_varsize_4b, PgRelation};
+use serde::{Deserialize, Serialize};
 
 pgrx::pg_module_magic!();
 
 #[pg_extern(sql = "
-    CREATE OR REPLACE FUNCTION pgmumbo_amhandler(internal)
+    CREATE OR REPLACE FUNCTION pgmumbo_am_handler(internal)
         RETURNS index_am_handler
-        PARALLEL SAFE IMMUTABLE STRICT
-        COST 0.0001
+        STRICT
         LANGUAGE c
-        AS 'MODULE_PATHNAME', '@FUNCTION_NAME@';
+        AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
     CREATE ACCESS METHOD pgmumbo 
         TYPE INDEX
-        HANDLER pgmumbo_amhandler;
+        HANDLER pgmumbo_am_handler;
 ")]
 fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine> {
     let mut amroutine =
@@ -43,16 +50,40 @@ fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine>
     amroutine.into_pg_boxed()
 }
 
+const VERSION_MAJOR: u32 = 0;
+const VERSION_MINOR: u32 = 0;
+const VERSION_PATCH: u32 = 0;
+
+const PGDATA_BASE: &'static str = "pgmumbo";
+
 const INITIAL_LMDB_MMAP_SIZE: usize = 64 * 1024 * 1024 * 1024; // Initialize LMDB with 64 GB memory map
 
-#[repr(C)]
-struct MumboIndexOptionsData {
-    vl_len_: i32, // Postgres varlena header
-    relpath_offset: i32, // Offset
+#[derive(Copy, Clone, PostgresType, Serialize, Deserialize)]
+#[pgvarlena_inoutfuncs]
+struct MumboIndexOptions {
+    version_major: u32,
+    version_minor: u32,
+    version_patch: u32,
 }
 
-fn pgdata_path() -> CString {
-    unsafe { CStr::from_ptr(pg_sys::DataDir) }.into()
+impl PgVarlenaInOutFuncs for MumboIndexOptions {
+    fn input(input: &core::ffi::CStr) -> PgVarlena<Self>
+    where
+        Self: Copy + Sized,
+    {
+        let deserialized: MumboIndexOptions =
+            serde_json::from_str(input.to_str().unwrap_or_report()).unwrap_or_report();
+
+        let mut result = PgVarlena::<MumboIndexOptions>::new();
+        result.version_major = deserialized.version_major;
+        result.version_minor = deserialized.version_minor;
+        result.version_patch = deserialized.version_patch;
+        result
+    }
+
+    fn output(&self, buffer: &mut pgrx::StringInfo) {
+        buffer.push_str(serde_json::to_string(self).unwrap_or_report().as_str())
+    }
 }
 
 #[pg_guard]
@@ -69,21 +100,26 @@ pub extern "C" fn ambuild(
     assert!(index_relation.is_index());
 
     let index_options = if index_relation.rd_options.is_null() {
-        let options = unsafe { PgBox::<MumboIndexOptionsData>::alloc0() };
+        let options = unsafe { PgBox::<MumboIndexOptions>::alloc0() };
         unsafe {
             set_varsize_4b(
                 options.as_ptr().cast(),
-                size_of::<MumboIndexOptionsData>() as i32,
+                size_of::<MumboIndexOptions>() as i32,
             );
         }
         options.into_pg_boxed()
     } else {
-        unsafe { PgBox::from_pg(index_relation.rd_options as *mut MumboIndexOptionsData) }
+        unsafe { PgBox::from_pg(index_relation.rd_options as *mut MumboIndexOptions) }
     };
 
     let index_oid = index_relation.oid();
-
-    let PGDATA = ;
+    let path = Path::new(
+        unsafe { CStr::from_ptr(pg_sys::DataDir) }
+            .to_str()
+            .unwrap_or_report(),
+    )
+    .join(PGDATA_BASE)
+    .join(format!("{:x}", unsafe { pg_sys::MyDatabaseId }.as_u32()));
 
     todo!()
 }
