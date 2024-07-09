@@ -54,7 +54,7 @@ fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine>
     amroutine.into_pg_boxed()
 }
 
-const PGDATA_BASE: &'static str = "pgmumbo";
+const PGDATA_BASE: &'static str = "ext_pgmumbo";
 
 const INITIAL_LMDB_MMAP_SIZE: usize = 64 * 1024 * 1024 * 1024; // Initialize LMDB with 64 GB memory map
 
