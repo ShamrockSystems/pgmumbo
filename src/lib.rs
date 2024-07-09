@@ -1,13 +1,17 @@
 use std::{
     ffi::{CStr, CString, OsStr, OsString},
     fmt::format,
+    fs,
     mem::size_of,
     path::Path,
     str::FromStr,
 };
 
-use pg_sys::panic::ErrorReportable;
-use pgrx::{prelude::*, set_varsize_4b, PgRelation};
+use milli::{
+    heed::EnvOpenOptions, update::IndexerConfig as MilliIndexerConfig, Index as MilliIndex,
+};
+use pg_sys::{panic::ErrorReportable, StdRdOptions};
+use pgrx::{prelude::*, set_varsize_4b, PgRelation, NULL};
 use serde::{Deserialize, Serialize};
 
 pgrx::pg_module_magic!();
@@ -50,40 +54,20 @@ fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine>
     amroutine.into_pg_boxed()
 }
 
-const VERSION_MAJOR: u32 = 0;
-const VERSION_MINOR: u32 = 0;
-const VERSION_PATCH: u32 = 0;
-
 const PGDATA_BASE: &'static str = "pgmumbo";
 
 const INITIAL_LMDB_MMAP_SIZE: usize = 64 * 1024 * 1024 * 1024; // Initialize LMDB with 64 GB memory map
 
-#[derive(Copy, Clone, PostgresType, Serialize, Deserialize)]
-#[pgvarlena_inoutfuncs]
-struct MumboIndexOptions {
-    version_major: u32,
-    version_minor: u32,
-    version_patch: u32,
+#[derive(Serialize, Deserialize)]
+struct Version {
+    major: u32,
+    minor: u32,
+    patch: u32,
 }
 
-impl PgVarlenaInOutFuncs for MumboIndexOptions {
-    fn input(input: &core::ffi::CStr) -> PgVarlena<Self>
-    where
-        Self: Copy + Sized,
-    {
-        let deserialized: MumboIndexOptions =
-            serde_json::from_str(input.to_str().unwrap_or_report()).unwrap_or_report();
-
-        let mut result = PgVarlena::<MumboIndexOptions>::new();
-        result.version_major = deserialized.version_major;
-        result.version_minor = deserialized.version_minor;
-        result.version_patch = deserialized.version_patch;
-        result
-    }
-
-    fn output(&self, buffer: &mut pgrx::StringInfo) {
-        buffer.push_str(serde_json::to_string(self).unwrap_or_report().as_str())
-    }
+#[derive(Serialize, Deserialize)]
+struct MumboIndexOptions {
+    version: Version,
 }
 
 #[pg_guard]
@@ -99,27 +83,22 @@ pub extern "C" fn ambuild(
 
     assert!(index_relation.is_index());
 
-    let index_options = if index_relation.rd_options.is_null() {
-        let options = unsafe { PgBox::<MumboIndexOptions>::alloc0() };
-        unsafe {
-            set_varsize_4b(
-                options.as_ptr().cast(),
-                size_of::<MumboIndexOptions>() as i32,
-            );
-        }
-        options.into_pg_boxed()
-    } else {
-        unsafe { PgBox::from_pg(index_relation.rd_options as *mut MumboIndexOptions) }
-    };
+    let index_path = Path::new(unsafe { CStr::from_ptr(pg_sys::DataDir) }.to_str().unwrap())
+        .join(PGDATA_BASE)
+        .join(format!("{:x}", unsafe { pg_sys::MyDatabaseId }.as_u32()))
+        .join(format!(
+            "{:x}-{:x}",
+            heap_relation.namespace_oid().as_u32(),
+            heap_relation.oid().as_u32(),
+        ));
+    let milli_config = MilliIndexerConfig::default();
+    let mut lmdb_options = EnvOpenOptions::new();
+    lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
 
-    let index_oid = index_relation.oid();
-    let path = Path::new(
-        unsafe { CStr::from_ptr(pg_sys::DataDir) }
-            .to_str()
-            .unwrap_or_report(),
-    )
-    .join(PGDATA_BASE)
-    .join(format!("{:x}", unsafe { pg_sys::MyDatabaseId }.as_u32()));
+    fs::create_dir_all(&index_path).unwrap();
+    let milli_index = MilliIndex::new(lmdb_options, &index_path).unwrap();
+
+    
 
     todo!()
 }
@@ -181,7 +160,7 @@ pub unsafe extern "C" fn amoptions(
     reloptions: pg_sys::Datum,
     validate: bool,
 ) -> *mut pg_sys::bytea {
-    todo!()
+    std::ptr::null::<pg_sys::bytea>() as *mut pg_sys::bytea
 }
 
 #[pg_guard]
