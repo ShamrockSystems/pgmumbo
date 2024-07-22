@@ -2,12 +2,12 @@
     <img alt="pgmumbo logo" src="pgmumbo.svg" width=400>
 </div>
 
-- [ ] Build heap scanner
-  - [ ] Figure out heap relation structure
-  - [ ] Determine primary key
-  - [ ] Convert row to milli document
-  - [ ] Setup scanning function
-  - [ ] Setup scanning callback
+- [x] Build heap scanner
+  - [x] Figure out heap relation structure
+  - [x] Determine primary key
+  - [x] Convert row to milli document
+  - [x] Setup scanning function
+  - [x] Setup scanning callback
 - [ ] Transaction hooks
   - [ ] add rows
   - [ ] remove rows
