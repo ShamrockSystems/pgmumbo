@@ -1,4 +1,14 @@
-use std::{ffi::CStr, fs, io::Cursor, iter::zip, path::Path};
+use std::{
+    ffi::CStr,
+    fs,
+    io::Cursor,
+    iter::{self, zip},
+    mem,
+    num::ParseIntError,
+    path::Path,
+    str::FromStr,
+    string::ParseError,
+};
 
 use milli::{
     documents::{DocumentsBatchBuilder, DocumentsBatchReader},
@@ -10,8 +20,9 @@ use milli::{
     },
     Index as MilliIndex,
 };
-use pg_sys::panic::ErrorReportable;
+use pg_sys::{palloc0, panic::ErrorReportable, FormData_pg_attribute, ItemPointerData, Oid};
 use pgrx::{prelude::*, PgMemoryContexts, PgRelation};
+use thiserror::Error;
 
 pgrx::pg_module_magic!();
 
@@ -40,7 +51,7 @@ fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine>
     amroutine.amcanmulticol = true;
     amroutine.amsearcharray = true;
 
-    amroutine.amkeytype = pg_sys::InvalidOid;
+    amroutine.amkeytype = Oid::INVALID;
 
     amroutine.ambuild = Some(ambuild);
     amroutine.ambuildempty = Some(ambuildempty);
@@ -167,7 +178,6 @@ pub extern "C" fn ambuild(
 
 struct BuildState {
     owned_context: PgMemoryContexts,
-    // Index-specific, depends on reloptions
     batch_builder: DocumentsBatchBuilder<Vec<u8>>,
 }
 
@@ -183,66 +193,97 @@ unsafe extern "C" fn build_callback(
     let build_state = (state as *mut BuildState).as_mut().unwrap();
     let mut old_owned_context = build_state.owned_context.set_as_current();
 
-    info!("pgmumbo heapscan: -------- CALLBACK --------");
-
-    let mut document = serde_json::Map::new();
-
-    let tid_value = format!(
-        "{}-{}_{}",
-        (*tid).ip_blkid.bi_hi,
-        (*tid).ip_blkid.bi_lo,
-        (*tid).ip_posid
-    );
-
-    info!("pgmumbo heapscan: PK: {TID_PRIMARY_KEY}, V: {tid_value}");
-    document.insert(
-        TID_PRIMARY_KEY.to_string(),
-        serde_json::Value::String(tid_value),
-    );
-
     let desc = (*index).rd_att.as_ref().unwrap();
     let natts = desc.natts as usize;
-    info!("pgmumbo heapscan: natts {natts}");
 
     let isnull = std::slice::from_raw_parts(isnull, natts);
     let attrs = desc.attrs.as_slice(natts);
     let values = std::slice::from_raw_parts(values, natts);
 
-    let it = zip(isnull, zip(attrs, values)).take(natts);
-    for (isnull, (attr, value)) in it {
-        if *isnull {
-            info!("pgmumbo heapscan: SKIP: isnull");
-            continue;
-        }
+    let document = form_document(TID(tid), isnull, attrs, values);
 
-        let detoasted = pg_sys::pg_detoast_datum(value.cast_mut_ptr());
-
-        let obj_key = CStr::from_ptr(attr.attname.data.as_ptr())
-            .to_str()
-            .unwrap_or_report()
-            .to_string();
-        let obj_value = match attr.atttypid {
-            pg_sys::TEXTOID => serde_json::Value::String(
-                CStr::from_ptr(pg_sys::text_to_cstring(detoasted.cast::<pg_sys::text>()))
-                    .to_str()
-                    .unwrap_or_report()
-                    .to_string(),
-            ),
-            _ => serde_json::Value::Null,
-        };
-
-        info!("pgmumbo heapscan: K: {obj_key}, V: {obj_value}");
-        document.insert(obj_key, obj_value);
-    }
+    info!("pgmumbo heapscan: {document:?}");
 
     build_state
         .batch_builder
         .append_json_object(&document)
         .unwrap_or_report();
-    info!("pgmumbo heapscan: Append OK!");
 
     old_owned_context.set_as_current();
     build_state.owned_context.reset();
+}
+
+struct TID(*mut pg_sys::ItemPointerData);
+
+impl ToString for TID {
+    fn to_string(&self) -> String {
+        format!(
+            "{}-{}_{}",
+            unsafe { *(self.0) }.ip_blkid.bi_hi,
+            unsafe { *(self.0) }.ip_blkid.bi_lo,
+            unsafe { *(self.0) }.ip_posid
+        )
+    }
+}
+impl FromStr for TID {
+    type Err = PgmumboError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (blk_str, pos_str) = s.split_once("_").ok_or(PgmumboError::TIDSplit)?;
+        let (blk_hi_str, blk_lo_str) = blk_str.split_once("-").ok_or(PgmumboError::TIDSplit)?;
+        let item_ptr: *mut ItemPointerData =
+            unsafe { palloc0(mem::size_of::<pg_sys::ItemPointerData>()).cast() };
+
+        unsafe { *item_ptr }.ip_blkid.bi_hi =
+            blk_hi_str.parse().map_err(PgmumboError::TIDParseInt)?;
+        unsafe { *item_ptr }.ip_blkid.bi_lo =
+            blk_lo_str.parse().map_err(PgmumboError::TIDParseInt)?;
+        unsafe { *item_ptr }.ip_posid = pos_str.parse().map_err(PgmumboError::TIDParseInt)?;
+
+        Ok(TID(item_ptr))
+    }
+}
+
+fn form_document(
+    tid: TID,
+    isnull: &[bool],
+    attrs: &[pg_sys::FormData_pg_attribute],
+    values: &[pg_sys::Datum],
+) -> serde_json::Map<String, serde_json::Value> {
+    serde_json::Map::from_iter(
+        // Managed primary key; 1:1 mapping with TID
+        iter::once((
+            TID_PRIMARY_KEY.to_string(),
+            serde_json::Value::String(tid.to_string()),
+        ))
+        // Then, convert tuple attrs and values to KV pairs
+        .chain(
+            zip(isnull, zip(attrs, values)).filter_map(|(isnull, (attr, value))| {
+                if *isnull {
+                    return None;
+                }
+                let detoasted = unsafe { pg_sys::pg_detoast_datum(value.cast_mut_ptr()) };
+                let document_key = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
+                    .to_str()
+                    .unwrap_or_report()
+                    .to_string();
+                let document_value = match attr.atttypid {
+                    pg_sys::TEXTOID => serde_json::Value::String(
+                        unsafe {
+                            CStr::from_ptr(pg_sys::text_to_cstring(
+                                detoasted.cast::<pg_sys::text>(),
+                            ))
+                        }
+                        .to_str()
+                        .unwrap_or_report()
+                        .to_string(),
+                    ),
+                    _ => serde_json::Value::Null,
+                };
+                Some((document_key, document_value))
+            }),
+        ),
+    )
 }
 
 #[pg_guard]
@@ -261,7 +302,7 @@ pub unsafe extern "C" fn aminsert(
     _index_unchanged: bool,
     _index_info: *mut pg_sys::IndexInfo,
 ) -> bool {
-    info!("pgmumbo aminsert");
+    info!("pgmumbo aminsert...");
 
     todo!()
 }
@@ -344,3 +385,11 @@ pub extern "C" fn amrescan(
 
 #[pg_guard]
 pub extern "C" fn amendscan(_scan: pg_sys::IndexScanDesc) {}
+
+#[derive(Error, Debug)]
+pub enum PgmumboError {
+    #[error("Failed to split TID serialization, it could be malformed")]
+    TIDSplit,
+    #[error("Failed to parse TID integer, it could be malformed")]
+    TIDParseInt(ParseIntError),
+}
