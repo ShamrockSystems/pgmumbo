@@ -1,14 +1,18 @@
+<div align="center">
+    <img alt="pgmumbo logo" src="pgmumbo.svg" width=400>
+</div>
+
 - [ ] Build heap scanner
-    - [ ] Figure out heap relation structure
-    - [ ] Determine primary key
-    - [ ] Convert row to milli document
-    - [ ] Setup scanning function
-    - [ ] Setup scanning callback
+  - [ ] Figure out heap relation structure
+  - [ ] Determine primary key
+  - [ ] Convert row to milli document
+  - [ ] Setup scanning function
+  - [ ] Setup scanning callback
 - [ ] Transaction hooks
-    - [ ] add rows
-    - [ ] remove rows
-    - [ ] add columns
-    - [ ] remove columns
+  - [ ] add rows
+  - [ ] remove rows
+  - [ ] add columns
+  - [ ] remove columns
 - [ ] Transaction abort callback
 
 Create canonical naming system for milli indices per namespaced OID. Allow multiple postgres indices to act on a single milli index. Maybe it'd be best to implement some sort of reference counting system at the extension-level? That way we can have a "master" index and "slave" indices. Otherwise stuff like `aminsert` would just not work properly.
