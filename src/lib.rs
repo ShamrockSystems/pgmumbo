@@ -1,10 +1,4 @@
-use std::{
-    ffi::CStr,
-    fs,
-    io::Cursor,
-    iter::zip,
-    path::Path,
-};
+use std::{ffi::CStr, fs, io::Cursor, iter::zip, path::Path};
 
 use milli::{
     documents::{DocumentsBatchBuilder, DocumentsBatchReader},
@@ -94,12 +88,8 @@ pub extern "C" fn ambuild(
             .unwrap_or_report(),
     )
     .join(PGDATA_BASE)
-    .join(format!("{:x}", unsafe { pg_sys::MyDatabaseId }.as_u32()))
-    .join(format!(
-        "{:x}-{:x}",
-        heap_relation.namespace_oid().as_u32(),
-        heap_relation.oid().as_u32(),
-    ));
+    .join(format!("{}", unsafe { pg_sys::MyDatabaseId }.as_u32()))
+    .join(format!("{}", index_relation.oid().as_u32(),));
     let milli_config = MilliIndexerConfig::default();
     let mut lmdb_options = EnvOpenOptions::new();
     lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
