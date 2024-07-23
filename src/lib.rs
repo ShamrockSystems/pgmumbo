@@ -5,7 +5,9 @@ use std::{
     iter::{self, zip},
     mem,
     num::ParseIntError,
+    os::raw,
     path::Path,
+    ptr, slice,
     str::FromStr,
     string::ParseError,
 };
@@ -196,9 +198,9 @@ unsafe extern "C" fn build_callback(
     let desc = (*index).rd_att.as_ref().unwrap();
     let natts = desc.natts as usize;
 
-    let isnull = std::slice::from_raw_parts(isnull, natts);
+    let isnull = slice::from_raw_parts(isnull, natts);
     let attrs = desc.attrs.as_slice(natts);
-    let values = std::slice::from_raw_parts(values, natts);
+    let values = slice::from_raw_parts(values, natts);
 
     let document = form_document(TID(tid), isnull, attrs, values);
 
@@ -338,12 +340,57 @@ pub unsafe extern "C" fn amcostestimate(
 ) {
 }
 
+struct PgmumboOptions {
+    milli_words_prefix_threshold: Option<u32>,
+    milli_max_prefix_length: Option<u32>,
+    milli_words_positions_level_group_size: Option<u32>,
+    milli_words_positions_min_level_size: Option<u32>,
+}
+
 #[pg_guard]
 pub unsafe extern "C" fn amoptions(
     reloptions: pg_sys::Datum,
     validate: bool,
 ) -> *mut pg_sys::bytea {
-    std::ptr::null::<pg_sys::bytea>() as *mut pg_sys::bytea
+    // pgmumbo encodes options using CBOR as opposed to StdRdOptions.
+    // Consequently, build_reloptions isn't used.
+    const TEXT_ELMTYPE: Oid = pg_sys::TEXTOID;
+    const TEXT_ELMLEN: raw::c_int = -1;
+    const TEXT_ELMBYVAL: bool = false;
+    const TEXT_ELMALIGN: raw::c_char = pg_sys::TYPALIGN_INT as raw::c_char;
+
+    let mut elemsp: *mut pg_sys::Datum = ptr::null_mut();
+    let mut nullsp: *mut bool = ptr::null_mut();
+    let nelemsp: *mut raw::c_int = ptr::null_mut();
+    pg_sys::deconstruct_array(
+        reloptions.cast_mut_ptr(),
+        TEXT_ELMTYPE,
+        TEXT_ELMLEN,
+        TEXT_ELMBYVAL,
+        TEXT_ELMALIGN,
+        &mut elemsp,
+        &mut nullsp,
+        nelemsp,
+    );
+
+    let nelem = *nelemsp as usize;
+    let elems = slice::from_raw_parts(elemsp, nelem);
+    let nulls = slice::from_raw_parts(nullsp, nelem);
+
+    let pairs = zip(nulls, elems).filter_map(|(null, elem)| {
+        if *null {
+            return None;
+        }
+        let pair = unsafe { CStr::from_ptr(pg_sys::text_to_cstring(elem.cast_mut_ptr())) }
+            .to_str()
+            .unwrap_or_report()
+            .split_once("=")
+            .unwrap();
+        Some(pair)
+    });
+
+    // let reloptions = std::slice::from_raw_parts(reloptions, len);
+    ptr::null_mut()
 }
 
 #[pg_guard]
