@@ -202,7 +202,7 @@ unsafe extern "C" fn build_callback(
     let attrs = desc.attrs.as_slice(natts);
     let values = slice::from_raw_parts(values, natts);
 
-    let document = form_document(Tid(tid), isnull, attrs, values);
+    let document = form_document(tid, isnull, attrs, values);
 
     info!("pgmumbo heapscan: {document:?}");
 
@@ -215,37 +215,30 @@ unsafe extern "C" fn build_callback(
     build_state.owned_context.reset();
 }
 
-struct Tid(*mut pg_sys::ItemPointerData);
-
-impl ToString for Tid {
-    fn to_string(&self) -> String {
-        format!(
-            "{}-{}_{}",
-            unsafe { *(self.0) }.ip_blkid.bi_hi,
-            unsafe { *(self.0) }.ip_blkid.bi_lo,
-            unsafe { *(self.0) }.ip_posid
-        )
-    }
+fn tid_to_name(ptr: pg_sys::ItemPointer) -> String {
+    format!(
+        "{}-{}_{}",
+        unsafe { *ptr }.ip_blkid.bi_hi,
+        unsafe { *ptr }.ip_blkid.bi_lo,
+        unsafe { *ptr }.ip_posid
+    )
 }
-impl FromStr for Tid {
-    type Err = Error;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (blk_str, pos_str) = s.split_once("_").ok_or(Error::TidSplit)?;
-        let (blk_hi_str, blk_lo_str) = blk_str.split_once("-").ok_or(Error::TidSplit)?;
-        let item_ptr: *mut ItemPointerData =
-            unsafe { palloc0(mem::size_of::<pg_sys::ItemPointerData>()).cast() };
+fn name_to_tid(s: &str) -> Result<pg_sys::ItemPointer, Error> {
+    let (blk_str, pos_str) = s.split_once("_").ok_or(Error::TidSplit)?;
+    let (blk_hi_str, blk_lo_str) = blk_str.split_once("-").ok_or(Error::TidSplit)?;
+    let item_ptr: *mut ItemPointerData =
+        unsafe { palloc0(mem::size_of::<pg_sys::ItemPointerData>()).cast() };
 
-        unsafe { *item_ptr }.ip_blkid.bi_hi = blk_hi_str.parse().map_err(Error::TidParseInt)?;
-        unsafe { *item_ptr }.ip_blkid.bi_lo = blk_lo_str.parse().map_err(Error::TidParseInt)?;
-        unsafe { *item_ptr }.ip_posid = pos_str.parse().map_err(Error::TidParseInt)?;
+    unsafe { *item_ptr }.ip_blkid.bi_hi = blk_hi_str.parse().map_err(Error::TidParseInt)?;
+    unsafe { *item_ptr }.ip_blkid.bi_lo = blk_lo_str.parse().map_err(Error::TidParseInt)?;
+    unsafe { *item_ptr }.ip_posid = pos_str.parse().map_err(Error::TidParseInt)?;
 
-        Ok(Tid(item_ptr))
-    }
+    Ok(item_ptr)
 }
 
 fn form_document(
-    tid: Tid,
+    tid: pg_sys::ItemPointer,
     isnull: &[bool],
     attrs: &[pg_sys::FormData_pg_attribute],
     values: &[pg_sys::Datum],
@@ -254,7 +247,7 @@ fn form_document(
         // Managed primary key; 1:1 mapping with TID
         iter::once((
             TID_PRIMARY_KEY.to_string(),
-            serde_json::Value::String(tid.to_string()),
+            serde_json::Value::String(tid_to_name(tid)),
         ))
         // Then, convert tuple attrs and values to KV pairs
         .chain(
