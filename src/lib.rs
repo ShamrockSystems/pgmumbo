@@ -94,8 +94,6 @@ pub extern "C" fn ambuild(
 ) -> *mut pg_sys::IndexBuildResult {
     info!("pgmumbo ambuild...");
 
-    let spcid = unsafe { *index_relation }.rd_node.spcNode;
-
     let heap_relation = unsafe { PgRelation::from_pg(heap_relation) };
     let index_relation = unsafe { PgRelation::from_pg(index_relation) };
 
@@ -104,10 +102,7 @@ pub extern "C" fn ambuild(
 
     // TODO setup abort callback
 
-    let index_path = spc_location(spcid)
-        .unwrap()
-        .join(format!("{}", unsafe { pg_sys::MyDatabaseId }.as_u32()))
-        .join(format!("{}", index_relation.oid().as_u32(),));
+    let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
     let milli_config = MilliIndexerConfig::default();
     let mut lmdb_options = EnvOpenOptions::new();
     lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
@@ -291,7 +286,6 @@ fn form_document(
     )
 }
 
-const PGDATA_EXT_BASE: &str = "ext_pgmumbo";
 const PGDATA_TBLSPC: &str = "pg_tblspc";
 
 fn spc_location(spc: Oid) -> Result<PathBuf, Error> {
@@ -309,16 +303,23 @@ fn spc_location(spc: Oid) -> Result<PathBuf, Error> {
     }
 
     if spc == pg_sys::DEFAULTTABLESPACE_OID || spc == pg_sys::GLOBALTABLESPACE_OID {
-        return Ok(pgdata.join(PGDATA_EXT_BASE).into());
+        return Ok(pgdata.into());
     }
 
-    Ok(pgdata
+    pgdata
         .join(PGDATA_TBLSPC)
         .join(spc.as_u32().to_string())
         .canonicalize()
-        .map_err(Error::SpaceResolve)?
+        .map_err(Error::SpaceResolve)
+}
+
+const PGDATA_EXT_BASE: &str = "ext_pgmumbo";
+
+fn lmdb_location(node: pg_sys::RelFileNode) -> Result<PathBuf, Error> {
+    Ok(spc_location(node.spcNode)?
         .join(PGDATA_EXT_BASE)
-        .into())
+        .join(node.dbNode.as_u32().to_string())
+        .join(node.relNode.as_u32().to_string()))
 }
 
 #[pg_guard]
