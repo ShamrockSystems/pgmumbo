@@ -1,15 +1,16 @@
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, BTreeSet, HashSet},
     convert::Infallible,
     ffi::CStr,
     fs,
-    io::Cursor,
+    io::{self, Cursor},
     iter::{self, zip},
     mem,
     num::ParseIntError,
     option,
     os::raw,
-    path::Path,
+    path::{Path, PathBuf},
     ptr, slice,
     str::FromStr,
     string::ParseError,
@@ -80,7 +81,6 @@ fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine>
 }
 
 const PROGRAM_NAME: &str = "pgmumbo";
-const PGDATA_BASE: &str = "ext_pgmumbo";
 
 const INITIAL_LMDB_MMAP_SIZE: usize = 64 * 1024 * 1024 * 1024; // Initialize LMDB with 64 GB memory map
 
@@ -94,6 +94,8 @@ pub extern "C" fn ambuild(
 ) -> *mut pg_sys::IndexBuildResult {
     info!("pgmumbo ambuild...");
 
+    let spcid = unsafe { *index_relation }.rd_node.spcNode;
+
     let heap_relation = unsafe { PgRelation::from_pg(heap_relation) };
     let index_relation = unsafe { PgRelation::from_pg(index_relation) };
 
@@ -102,14 +104,10 @@ pub extern "C" fn ambuild(
 
     // TODO setup abort callback
 
-    let index_path = Path::new(
-        unsafe { CStr::from_ptr(pg_sys::DataDir) }
-            .to_str()
-            .unwrap_or_report(),
-    )
-    .join(PGDATA_BASE)
-    .join(format!("{}", unsafe { pg_sys::MyDatabaseId }.as_u32()))
-    .join(format!("{}", index_relation.oid().as_u32(),));
+    let index_path = spc_location(spcid)
+        .unwrap()
+        .join(format!("{}", unsafe { pg_sys::MyDatabaseId }.as_u32()))
+        .join(format!("{}", index_relation.oid().as_u32(),));
     let milli_config = MilliIndexerConfig::default();
     let mut lmdb_options = EnvOpenOptions::new();
     lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
@@ -238,14 +236,14 @@ impl FromStr for Tid {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (blk_str, pos_str) = s.split_once("_").ok_or(Error::TIDSplit)?;
-        let (blk_hi_str, blk_lo_str) = blk_str.split_once("-").ok_or(Error::TIDSplit)?;
+        let (blk_str, pos_str) = s.split_once("_").ok_or(Error::TidSplit)?;
+        let (blk_hi_str, blk_lo_str) = blk_str.split_once("-").ok_or(Error::TidSplit)?;
         let item_ptr: *mut ItemPointerData =
             unsafe { palloc0(mem::size_of::<pg_sys::ItemPointerData>()).cast() };
 
-        unsafe { *item_ptr }.ip_blkid.bi_hi = blk_hi_str.parse().map_err(Error::TIDParseInt)?;
-        unsafe { *item_ptr }.ip_blkid.bi_lo = blk_lo_str.parse().map_err(Error::TIDParseInt)?;
-        unsafe { *item_ptr }.ip_posid = pos_str.parse().map_err(Error::TIDParseInt)?;
+        unsafe { *item_ptr }.ip_blkid.bi_hi = blk_hi_str.parse().map_err(Error::TidParseInt)?;
+        unsafe { *item_ptr }.ip_blkid.bi_lo = blk_lo_str.parse().map_err(Error::TidParseInt)?;
+        unsafe { *item_ptr }.ip_posid = pos_str.parse().map_err(Error::TidParseInt)?;
 
         Ok(Tid(item_ptr))
     }
@@ -291,6 +289,36 @@ fn form_document(
             }),
         ),
     )
+}
+
+const PGDATA_EXT_BASE: &str = "ext_pgmumbo";
+const PGDATA_TBLSPC: &str = "pg_tblspc";
+
+fn spc_location(spc: Oid) -> Result<PathBuf, Error> {
+    let my_database_spc = unsafe { pg_sys::MyDatabaseTableSpace };
+    let mut spc = spc;
+
+    let pgdata = Path::new(
+        unsafe { CStr::from_ptr(pg_sys::DataDir) }
+            .to_str()
+            .unwrap_or_report(),
+    );
+
+    if spc == Oid::INVALID {
+        spc = my_database_spc;
+    }
+
+    if spc == pg_sys::DEFAULTTABLESPACE_OID || spc == pg_sys::GLOBALTABLESPACE_OID {
+        return Ok(pgdata.join(PGDATA_EXT_BASE).into());
+    }
+
+    Ok(pgdata
+        .join(PGDATA_TBLSPC)
+        .join(spc.as_u32().to_string())
+        .canonicalize()
+        .map_err(Error::SpaceResolve)?
+        .join(PGDATA_EXT_BASE)
+        .into())
 }
 
 #[pg_guard]
@@ -525,13 +553,15 @@ pub extern "C" fn amendscan(_scan: pg_sys::IndexScanDesc) {}
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Failed to split TID serialization, it could be malformed")]
-    TIDSplit,
+    TidSplit,
     #[error("Failed to parse TID integer, it could be malformed")]
-    TIDParseInt(ParseIntError),
+    TidParseInt(ParseIntError),
     #[error("Failed to parse index option value from JSON")]
     OptionsParseValue(serde_json::Error),
     #[error("Failed to encode index options to CBOR")]
-    OptionsEncode(ciborium::ser::Error<std::io::Error>),
+    OptionsEncode(ciborium::ser::Error<io::Error>),
     #[error("Invalid index options keys")]
     OptionsInvalidKeys(Vec<String>),
+    #[error("Could not resolve index space OID")]
+    SpaceResolve(io::Error),
 }

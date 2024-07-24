@@ -14,7 +14,7 @@
   - [x] aminsert
   - [ ] ambulkdelete
   - [ ] amvacuumcleanup
-  - [ ] amoptions
+  - [x] amoptions
   - [x] amvalidate
   - [ ] ambeginscan
   - [ ] ambrescan
