@@ -6,7 +6,6 @@ use std::{
     iter::{self, zip},
     mem,
     num::{NonZeroU32, ParseIntError},
-    ops::Deref,
     os::raw,
     path::{Path, PathBuf},
     ptr, slice,
@@ -26,7 +25,7 @@ use milli::{
     CompressionType as MilliCompressionType, Criterion as MilliCriterion, Index as MilliIndex,
 };
 use pg_sys::{palloc0, panic::ErrorReportable, ItemPointerData, Oid};
-use pgrx::{prelude::*, PgMemoryContexts, PgRelation, NULL};
+use pgrx::{prelude::*, set_varsize_4b, vardata_4b, varsize_4b, PgMemoryContexts, PgRelation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_nested_with::serde_nested;
@@ -38,7 +37,7 @@ extension_sql_file!("lib.sql");
 
 #[allow(non_snake_case)]
 #[pg_guard]
-pub unsafe extern "C" fn _PG_init() {
+pub extern "C" fn _PG_init() {
     info!("{PROGRAM_NAME} loaded");
 }
 
@@ -96,7 +95,7 @@ pub extern "C" fn ambuild(
 
     // TODO setup abort callback
 
-    let options: Options = (&index_relation).try_into().unwrap_or_report();
+    let options: Options = index_relation.rd_options.try_into().unwrap_or_report();
 
     let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
     let mut lmdb_options = EnvOpenOptions::new();
@@ -329,10 +328,10 @@ pub extern "C" fn ambuildempty(_index_relation: pg_sys::Relation) {
 
 #[pg_guard]
 pub unsafe extern "C" fn aminsert(
-    index_relation: pg_sys::Relation,
-    values: *mut pg_sys::Datum,
+    _index_relation: pg_sys::Relation,
+    _values: *mut pg_sys::Datum,
     _isnull: *mut bool,
-    heap_tid: pg_sys::ItemPointer,
+    _heap_tid: pg_sys::ItemPointer,
     _heap_relation: pg_sys::Relation,
     _check_unique: pg_sys::IndexUniqueCheck::Type,
     _index_unchanged: bool,
@@ -345,8 +344,8 @@ pub unsafe extern "C" fn aminsert(
 
 #[pg_guard]
 pub extern "C" fn ambulkdelete(
-    info: *mut pg_sys::IndexVacuumInfo,
-    stats: *mut pg_sys::IndexBulkDeleteResult,
+    _info: *mut pg_sys::IndexVacuumInfo,
+    _stats: *mut pg_sys::IndexBulkDeleteResult,
     _callback: pg_sys::IndexBulkDeleteCallback,
     _callback_state: *mut ::std::os::raw::c_void,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
@@ -355,8 +354,8 @@ pub extern "C" fn ambulkdelete(
 
 #[pg_guard]
 pub extern "C" fn amvacuumcleanup(
-    info: *mut pg_sys::IndexVacuumInfo,
-    stats: *mut pg_sys::IndexBulkDeleteResult,
+    _info: *mut pg_sys::IndexVacuumInfo,
+    _stats: *mut pg_sys::IndexBulkDeleteResult,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
     todo!()
 }
@@ -364,13 +363,13 @@ pub extern "C" fn amvacuumcleanup(
 #[pg_guard(immutable, parallel_safe)]
 pub unsafe extern "C" fn amcostestimate(
     _root: *mut pg_sys::PlannerInfo,
-    path: *mut pg_sys::IndexPath,
+    _path: *mut pg_sys::IndexPath,
     _loop_count: f64,
-    index_startup_cost: *mut pg_sys::Cost,
-    index_total_cost: *mut pg_sys::Cost,
-    index_selectivity: *mut pg_sys::Selectivity,
-    index_correlation: *mut f64,
-    index_pages: *mut f64,
+    _index_startup_cost: *mut pg_sys::Cost,
+    _index_total_cost: *mut pg_sys::Cost,
+    _index_selectivity: *mut pg_sys::Selectivity,
+    _index_correlation: *mut f64,
+    _index_pages: *mut f64,
 ) {
 }
 
@@ -438,11 +437,15 @@ lazy_static! {
 }
 
 #[pg_guard]
-pub unsafe extern "C" fn amoptions(
-    reloptions: pg_sys::Datum,
-    validate: bool,
-) -> *mut pg_sys::bytea {
+pub extern "C" fn amoptions(reloptions: pg_sys::Datum, validate: bool) -> *mut pg_sys::bytea {
     info!("pgmumbo amoptions... validate {validate}");
+    if reloptions.is_null() {
+        return ptr::null_mut();
+    }
+
+    let reloptions =
+        unsafe { pg_sys::pg_detoast_datum(reloptions.cast_mut_ptr()) } as *mut pg_sys::ArrayType;
+
     // pgmumbo encodes options using CBOR as opposed to StdRdOptions.
     // Consequently, build_reloptions isn't used.
     const TEXT_ELMTYPE: Oid = pg_sys::TEXTOID;
@@ -450,28 +453,27 @@ pub unsafe extern "C" fn amoptions(
     const TEXT_ELMBYVAL: bool = false;
     const TEXT_ELMALIGN: raw::c_char = pg_sys::TYPALIGN_INT as raw::c_char;
 
-    info!("decon");
     let mut elemsp: *mut pg_sys::Datum = ptr::null_mut();
     let mut nullsp: *mut bool = ptr::null_mut();
     let mut nelemsp: raw::c_int = 0;
-    pg_sys::deconstruct_array(
-        reloptions.cast_mut_ptr(),
-        TEXT_ELMTYPE,
-        TEXT_ELMLEN,
-        TEXT_ELMBYVAL,
-        TEXT_ELMALIGN,
-        &mut elemsp,
-        &mut nullsp,
-        &mut nelemsp,
-    );
-
-    info!("slice {}, {:?}, {:?}", nelemsp, elemsp, nullsp);
+    unsafe {
+        pg_sys::deconstruct_array(
+            reloptions,
+            TEXT_ELMTYPE,
+            TEXT_ELMLEN,
+            TEXT_ELMBYVAL,
+            TEXT_ELMALIGN,
+            &mut elemsp,
+            &mut nullsp,
+            &mut nelemsp,
+        )
+    };
+    let elemsp = unsafe { PgBox::<pg_sys::Datum>::from_rust(elemsp) };
+    let nullsp = unsafe { PgBox::<bool>::from_rust(nullsp) };
 
     let nelem = nelemsp as usize;
-    let elems = slice::from_raw_parts(elemsp, nelem);
-    let nulls = slice::from_raw_parts(nullsp, nelem);
-
-    info!("retrieved {nelem} options");
+    let elems = unsafe { slice::from_raw_parts(elemsp.as_ref(), nelem) };
+    let nulls = unsafe { slice::from_raw_parts(nullsp.as_ref(), nelem) };
 
     let bytes = match encode_options(validate, elems, nulls) {
         Ok(bytes) => bytes,
@@ -484,21 +486,21 @@ pub unsafe extern "C" fn amoptions(
         }
     };
 
-    info!("encoded.");
-
     let encoded_size = mem::size_of::<[::std::os::raw::c_char; 4usize]>() + bytes.len();
-    let encoded = pg_sys::palloc0(encoded_size) as *mut pg_sys::bytea;
+    let encoded = unsafe {
+        PgBox::<pg_sys::bytea>::from_rust(pg_sys::palloc0(encoded_size) as *mut pg_sys::bytea)
+    };
 
-    (*encoded).vl_len_ = (encoded_size as i32).to_ne_bytes().map(|x| x as i8);
-    ptr::copy_nonoverlapping(
-        bytes.as_ptr(),
-        (*encoded).vl_dat.as_mut_ptr() as *mut u8,
-        bytes.len(),
-    );
+    unsafe { set_varsize_4b(encoded.as_ptr(), encoded_size as i32) };
+    unsafe {
+        ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            vardata_4b(encoded.as_ptr()) as *mut u8,
+            bytes.len(),
+        )
+    };
 
-    info!("{:?}", *encoded);
-
-    encoded
+    encoded.into_pg()
 }
 
 fn encode_options(
@@ -522,9 +524,7 @@ fn encode_options(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(Error::OptionsParseValue)?;
-    info!("{pairs:?}");
     let options_map = serde_json::Map::from_iter(pairs);
-    info!("{options_map:?}");
 
     if validate {
         let difference: Vec<_> = options_map
@@ -540,33 +540,28 @@ fn encode_options(
     let options: Options = serde_json::from_value(serde_json::Value::Object(options_map))
         .map_err(Error::OptionsParseValue)?;
 
-    info!(
-        "pgmumbo: new options: {}",
-        serde_json::to_string(&options).unwrap()
-    );
-
     let mut bytes = Vec::new();
     ciborium::into_writer(&options, &mut bytes).map_err(Error::OptionsEncode)?;
 
     Ok(bytes)
 }
 
-impl TryFrom<&PgRelation> for Options {
+impl TryFrom<*mut pg_sys::varlena> for Options {
     type Error = Error;
 
-    fn try_from(index_relation: &PgRelation) -> Result<Self, Self::Error> {
-        if index_relation.rd_options.is_null() {
+    fn try_from(options_data: *mut pg_sys::varlena) -> Result<Self, Self::Error> {
+        if options_data.is_null() {
             return Ok(Self::default());
         }
 
-        let rd_options_data = unsafe {
+        let options_data = unsafe {
             slice::from_raw_parts(
-                (*index_relation.rd_options).vl_dat.as_ptr().cast::<u8>(),
-                u32::from_ne_bytes((*index_relation.rd_options).vl_len_.map(|x| x as u8)) as usize,
+                vardata_4b(options_data) as *const u8,
+                varsize_4b(options_data),
             )
         };
 
-        ciborium::from_reader(rd_options_data).map_err(Error::OptionsDecode)
+        ciborium::from_reader(options_data).map_err(Error::OptionsDecode)
     }
 }
 
@@ -612,18 +607,18 @@ pub extern "C" fn amvalidate(_opclassoid: pg_sys::Oid) -> bool {
 
 #[pg_guard]
 pub extern "C" fn ambeginscan(
-    index_relation: pg_sys::Relation,
-    nkeys: ::std::os::raw::c_int,
-    norderbys: ::std::os::raw::c_int,
+    _index_relation: pg_sys::Relation,
+    _nkeys: ::std::os::raw::c_int,
+    _norderbys: ::std::os::raw::c_int,
 ) -> pg_sys::IndexScanDesc {
     todo!()
 }
 
 #[pg_guard]
 pub extern "C" fn amrescan(
-    scan: pg_sys::IndexScanDesc,
-    keys: pg_sys::ScanKey,
-    nkeys: ::std::os::raw::c_int,
+    _scan: pg_sys::IndexScanDesc,
+    _keys: pg_sys::ScanKey,
+    _nkeys: ::std::os::raw::c_int,
     _orderbys: pg_sys::ScanKey,
     _norderbys: ::std::os::raw::c_int,
 ) {
