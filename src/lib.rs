@@ -1,19 +1,15 @@
 use std::{
-    borrow::Borrow,
     collections::{BTreeMap, BTreeSet, HashSet},
-    convert::Infallible,
     ffi::CStr,
     fs,
     io::{self, Cursor},
     iter::{self, zip},
     mem,
-    num::ParseIntError,
-    option,
+    num::{NonZeroU32, ParseIntError},
+    ops::Deref,
     os::raw,
     path::{Path, PathBuf},
     ptr, slice,
-    str::FromStr,
-    string::ParseError,
 };
 
 use lazy_static::lazy_static;
@@ -21,37 +17,36 @@ use milli::{
     documents::{DocumentsBatchBuilder, DocumentsBatchReader},
     heed::EnvOpenOptions,
     order_by_map::OrderByMap as MilliOrderByMap,
+    proximity::ProximityPrecision as MilliProximityPrecision,
     update::{
         IndexDocuments as MilliIndexDocuments, IndexDocumentsConfig as MilliIndexDocumentsConfig,
         IndexDocumentsMethod as MilliIndexDocumentsMethod, IndexerConfig as MilliIndexerConfig,
         Settings as MilliSettings,
     },
-    Criterion as MilliCriterion, Index as MilliIndex,
+    CompressionType as MilliCompressionType, Criterion as MilliCriterion, Index as MilliIndex,
 };
-use pg_sys::{palloc0, panic::ErrorReportable, FormData_pg_attribute, ItemPointerData, Oid};
-use pgrx::{prelude::*, PgMemoryContexts, PgRelation};
+use pg_sys::{palloc0, panic::ErrorReportable, ItemPointerData, Oid};
+use pgrx::{prelude::*, PgMemoryContexts, PgRelation, NULL};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_nested_with::serde_nested;
 use thiserror::Error;
 
 pgrx::pg_module_magic!();
 
-extension_sql_file!("operator_class.sql");
+extension_sql_file!("lib.sql");
 
+#[allow(non_snake_case)]
 #[pg_guard]
 pub unsafe extern "C" fn _PG_init() {
     info!("{PROGRAM_NAME} loaded");
 }
 
 #[pg_extern(sql = "
-    CREATE OR REPLACE FUNCTION pgmumbo_am_handler(internal) RETURNS index_am_handler
+    CREATE OR REPLACE FUNCTION pgmumbo_amhandler(internal) RETURNS index_am_handler
         STRICT
         LANGUAGE c
-        AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';
-    CREATE ACCESS METHOD pgmumbo 
-        TYPE INDEX
-        HANDLER pgmumbo_am_handler;
-")]
+        AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';")]
 fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine> {
     let mut amroutine =
         unsafe { PgBox::<pg_sys::IndexAmRoutine>::alloc_node(pg_sys::NodeTag::T_IndexAmRoutine) };
@@ -92,33 +87,33 @@ pub extern "C" fn ambuild(
     index_relation: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
-    info!("pgmumbo ambuild...");
+    info!("pgmumbo ambuild");
 
     let heap_relation = unsafe { PgRelation::from_pg(heap_relation) };
     let index_relation = unsafe { PgRelation::from_pg(index_relation) };
 
     assert!(index_relation.is_index());
-    info!("pgmumbo ambuild: Preflight OK!");
 
     // TODO setup abort callback
 
+    let options: Options = (&index_relation).try_into().unwrap_or_report();
+
     let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
-    let milli_config = MilliIndexerConfig::default();
     let mut lmdb_options = EnvOpenOptions::new();
     lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
-    info!("pgmumbo ambuild: Building at: {index_path:?}");
-    info!("pgmumbo ambuild: Memory Map: {INITIAL_LMDB_MMAP_SIZE} bytes");
 
+    info!("Building a new index at: {index_path:?}");
+    if index_path.exists() {
+        warning!("Existing files in index location that should not be there, deleting them...");
+        fs::remove_dir_all(&index_path).unwrap_or_report();
+    }
     fs::create_dir_all(&index_path).unwrap_or_report();
     let milli_index = MilliIndex::new(lmdb_options, &index_path).unwrap_or_report();
-    info!("pgmumbo ambuild: Opened OK!");
 
     let mut build_state = BuildState {
         owned_context: PgMemoryContexts::new(PROGRAM_NAME),
         batch_builder: DocumentsBatchBuilder::new(Vec::new()),
     };
-
-    info!("pgmumbo ambuild: HeapScan...");
 
     unsafe {
         pg_sys::IndexBuildHeapScan(
@@ -130,47 +125,59 @@ pub extern "C" fn ambuild(
         )
     }
 
-    info!("pgmumbo ambuild: HeapScan OK!");
-
-    info!("pgmumbo ambuild: LMDB wtxn...");
     let documents = build_state.batch_builder.into_inner().unwrap_or_report();
     let mut wtxn = milli_index.write_txn().unwrap_or_report();
 
-    info!("pgmumbo ambuild: Settings...");
-    let mut milli_settings = MilliSettings::new(&mut wtxn, &milli_index, &milli_config);
+    let milli_idx_config: MilliIndexerConfig = (&options).into();
+    let milli_idx_doc_config: MilliIndexDocumentsConfig = (&options).into();
+    let mut milli_settings = MilliSettings::new(&mut wtxn, &milli_index, &milli_idx_config);
     milli_settings.set_primary_key(TID_PRIMARY_KEY.to_string());
+    macro_rules! set_ms_option {
+        ($option:ident, $method:ident) => {
+            if let Some(x) = options.$option {
+                milli_settings.$method(x);
+            }
+        };
+    }
+    set_ms_option!(ms_searchable_fields, set_searchable_fields);
+    set_ms_option!(ms_displayed_fields, set_displayed_fields);
+    set_ms_option!(ms_filterable_fields, set_filterable_fields);
+    set_ms_option!(ms_sortable_fields, set_sortable_fields);
+    set_ms_option!(ms_criteria, set_criteria);
+    set_ms_option!(ms_stop_words, set_stop_words);
+    set_ms_option!(ms_non_separator_tokens, set_non_separator_tokens);
+    set_ms_option!(ms_separator_tokens, set_separator_tokens);
+    set_ms_option!(ms_dictionary, set_dictionary);
+    set_ms_option!(ms_distinct_field, set_distinct_field);
+    set_ms_option!(ms_synonyms, set_synonyms);
+    set_ms_option!(ms_authorize_typos, set_autorize_typos);
+    set_ms_option!(ms_min_word_len_two_typos, set_min_word_len_two_typos);
+    set_ms_option!(ms_min_word_len_one_typo, set_min_word_len_one_typo);
+    set_ms_option!(ms_exact_words, set_exact_words);
+    set_ms_option!(ms_exact_attributes, set_exact_attributes);
+    set_ms_option!(ms_max_values_per_facet, set_max_values_per_facet);
+    set_ms_option!(ms_sort_facet_values_by, set_sort_facet_values_by);
+    set_ms_option!(ms_pagination_max_total_hits, set_pagination_max_total_hits);
+    set_ms_option!(ms_proximity_precision, set_proximity_precision);
+    set_ms_option!(ms_search_cutoff, set_search_cutoff);
     milli_settings.execute(|_| {}, || false).unwrap();
 
     let mut indexer = MilliIndexDocuments::new(
         &mut wtxn,
         &milli_index,
-        &milli_config,
-        MilliIndexDocumentsConfig {
-            words_prefix_threshold: None,
-            max_prefix_length: None,
-            words_positions_level_group_size: None,
-            words_positions_min_level_size: None,
-            update_method: MilliIndexDocumentsMethod::ReplaceDocuments,
-            autogenerate_docids: false,
-        },
+        &milli_idx_config,
+        milli_idx_doc_config,
         |_| {},
         || false,
     )
     .unwrap_or_report();
 
-    info!("pgmumbo ambuild: LMDB wtxn... Execute...");
     (indexer, _) = indexer
         .add_documents(DocumentsBatchReader::from_reader(Cursor::new(documents)).unwrap_or_report())
         .unwrap_or_report();
     let index_result = indexer.execute().unwrap_or_report();
 
-    info!("pgmumbo ambuild: LMDB wtxn... COMMIT...");
     wtxn.commit().unwrap_or_report();
-
-    info!(
-        "pgmumbo ambuild: COMMIT OK! (added {}, total {})",
-        index_result.indexed_documents, index_result.number_of_documents
-    );
 
     let mut build_result = unsafe { PgBox::<pg_sys::IndexBuildResult>::alloc0() };
     build_result.heap_tuples = index_result.number_of_documents as f64;
@@ -367,40 +374,63 @@ pub unsafe extern "C" fn amcostestimate(
 ) {
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "MilliCompressionType")]
+enum MilliCompressionTypeDef {
+    None = 0,
+    SnappyPre05 = 1,
+    Zlib = 2,
+    Lz4 = 3,
+    Zstd = 4,
+    Snappy = 5,
+}
+
+#[serde_nested]
 #[derive(Default, Serialize, Deserialize)]
-struct PgmumboOptions {
+struct Options {
+    // Unmanaged MilliIndexerConfig fields
+    mc_log_every_n: Option<usize>,
+    mc_max_nb_chunks: Option<usize>,
+    mc_documents_chunk_size: Option<usize>,
+    mc_max_memory: Option<usize>,
+    #[serde(default)]
+    #[serde_nested(sub = "MilliCompressionType", serde(with = "MilliCompressionTypeDef"))]
+    mc_chunk_compression_type: Option<MilliCompressionType>,
+    mc_chunk_compression_level: Option<u32>,
+    mc_max_positions_per_attributes: Option<u32>,
+    mc_skip_index_budget: Option<bool>,
     // Unmanaged MilliSettings fields
-    m_searchable_fields: Option<Vec<String>>,
-    m_displayed_fields: Option<Vec<String>>,
-    m_filterable_fields: Option<HashSet<String>>,
-    m_sortable_fields: Option<HashSet<String>>,
-    m_criteria: Option<Vec<MilliCriterion>>,
-    m_stop_words: Option<BTreeSet<String>>,
-    m_non_separator_tokens: Option<BTreeSet<String>>,
-    m_separator_tokens: Option<BTreeSet<String>>,
-    m_dictionary: Option<BTreeSet<String>>,
-    m_distinct_field: Option<String>,
-    m_synonyms: Option<BTreeMap<String, Vec<String>>>,
-    m_authorize_typos: Option<bool>,
-    m_min_word_len_two_typos: Option<u8>,
-    m_min_word_len_one_typo: Option<u8>,
-    m_exact_words: Option<BTreeSet<String>>,
-    m_exact_attributes: Option<HashSet<String>>,
-    m_max_values_per_facet: Option<usize>,
-    m_sort_facet_values_by: Option<MilliOrderByMap>,
-    m_pagination_max_total_hits: Option<usize>,
-    m_proximity_precision: Option<usize>,
-    m_search_cutoff: Option<u64>,
+    ms_searchable_fields: Option<Vec<String>>,
+    ms_displayed_fields: Option<Vec<String>>,
+    ms_filterable_fields: Option<HashSet<String>>,
+    ms_sortable_fields: Option<HashSet<String>>,
+    ms_criteria: Option<Vec<MilliCriterion>>,
+    ms_stop_words: Option<BTreeSet<String>>,
+    ms_non_separator_tokens: Option<BTreeSet<String>>,
+    ms_separator_tokens: Option<BTreeSet<String>>,
+    ms_dictionary: Option<BTreeSet<String>>,
+    ms_distinct_field: Option<String>,
+    ms_synonyms: Option<BTreeMap<String, Vec<String>>>,
+    ms_authorize_typos: Option<bool>,
+    ms_min_word_len_two_typos: Option<u8>,
+    ms_min_word_len_one_typo: Option<u8>,
+    ms_exact_words: Option<BTreeSet<String>>,
+    ms_exact_attributes: Option<HashSet<String>>,
+    ms_max_values_per_facet: Option<usize>,
+    ms_sort_facet_values_by: Option<MilliOrderByMap>,
+    ms_pagination_max_total_hits: Option<usize>,
+    ms_proximity_precision: Option<MilliProximityPrecision>,
+    ms_search_cutoff: Option<u64>,
     // Unmanaged MilliIndexDocumentsConfig fields
-    m_doc_words_prefix_threshold: Option<u32>,
-    m_doc_max_prefix_length: Option<u32>,
-    m_doc_words_positions_level_group_size: Option<u32>,
-    m_doc_words_positions_min_level_size: Option<u32>,
+    mid_doc_words_prefix_threshold: Option<u32>,
+    mid_doc_max_prefix_length: Option<usize>,
+    mid_doc_words_positions_level_group_size: Option<NonZeroU32>,
+    mid_doc_words_positions_min_level_size: Option<NonZeroU32>,
 }
 
 lazy_static! {
     static ref options_field_names: HashSet<String> =
-        if let Value::Object(map) = serde_json::to_value(PgmumboOptions::default()).unwrap() {
+        if let Value::Object(map) = serde_json::to_value(Options::default()).unwrap() {
             map.keys().cloned().collect()
         } else {
             panic!()
@@ -412,6 +442,7 @@ pub unsafe extern "C" fn amoptions(
     reloptions: pg_sys::Datum,
     validate: bool,
 ) -> *mut pg_sys::bytea {
+    info!("pgmumbo amoptions... validate {validate}");
     // pgmumbo encodes options using CBOR as opposed to StdRdOptions.
     // Consequently, build_reloptions isn't used.
     const TEXT_ELMTYPE: Oid = pg_sys::TEXTOID;
@@ -419,9 +450,10 @@ pub unsafe extern "C" fn amoptions(
     const TEXT_ELMBYVAL: bool = false;
     const TEXT_ELMALIGN: raw::c_char = pg_sys::TYPALIGN_INT as raw::c_char;
 
+    info!("decon");
     let mut elemsp: *mut pg_sys::Datum = ptr::null_mut();
     let mut nullsp: *mut bool = ptr::null_mut();
-    let nelemsp: *mut raw::c_int = ptr::null_mut();
+    let mut nelemsp: raw::c_int = 0;
     pg_sys::deconstruct_array(
         reloptions.cast_mut_ptr(),
         TEXT_ELMTYPE,
@@ -430,12 +462,16 @@ pub unsafe extern "C" fn amoptions(
         TEXT_ELMALIGN,
         &mut elemsp,
         &mut nullsp,
-        nelemsp,
+        &mut nelemsp,
     );
 
-    let nelem = *nelemsp as usize;
+    info!("slice {}, {:?}, {:?}", nelemsp, elemsp, nullsp);
+
+    let nelem = nelemsp as usize;
     let elems = slice::from_raw_parts(elemsp, nelem);
     let nulls = slice::from_raw_parts(nullsp, nelem);
+
+    info!("retrieved {nelem} options");
 
     let bytes = match encode_options(validate, elems, nulls) {
         Ok(bytes) => bytes,
@@ -448,6 +484,8 @@ pub unsafe extern "C" fn amoptions(
         }
     };
 
+    info!("encoded.");
+
     let encoded_size = mem::size_of::<[::std::os::raw::c_char; 4usize]>() + bytes.len();
     let encoded = pg_sys::palloc0(encoded_size) as *mut pg_sys::bytea;
 
@@ -457,6 +495,8 @@ pub unsafe extern "C" fn amoptions(
         (*encoded).vl_dat.as_mut_ptr() as *mut u8,
         bytes.len(),
     );
+
+    info!("{:?}", *encoded);
 
     encoded
 }
@@ -482,7 +522,9 @@ fn encode_options(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(Error::OptionsParseValue)?;
+    info!("{pairs:?}");
     let options_map = serde_json::Map::from_iter(pairs);
+    info!("{options_map:?}");
 
     if validate {
         let difference: Vec<_> = options_map
@@ -495,13 +537,72 @@ fn encode_options(
         }
     }
 
-    let options: PgmumboOptions = serde_json::from_value(serde_json::Value::Object(options_map))
+    let options: Options = serde_json::from_value(serde_json::Value::Object(options_map))
         .map_err(Error::OptionsParseValue)?;
+
+    info!(
+        "pgmumbo: new options: {}",
+        serde_json::to_string(&options).unwrap()
+    );
 
     let mut bytes = Vec::new();
     ciborium::into_writer(&options, &mut bytes).map_err(Error::OptionsEncode)?;
 
     Ok(bytes)
+}
+
+impl TryFrom<&PgRelation> for Options {
+    type Error = Error;
+
+    fn try_from(index_relation: &PgRelation) -> Result<Self, Self::Error> {
+        if index_relation.rd_options.is_null() {
+            return Ok(Self::default());
+        }
+
+        let rd_options_data = unsafe {
+            slice::from_raw_parts(
+                (*index_relation.rd_options).vl_dat.as_ptr().cast::<u8>(),
+                u32::from_ne_bytes((*index_relation.rd_options).vl_len_.map(|x| x as u8)) as usize,
+            )
+        };
+
+        ciborium::from_reader(rd_options_data).map_err(Error::OptionsDecode)
+    }
+}
+
+impl Into<MilliIndexerConfig> for &Options {
+    fn into(self) -> MilliIndexerConfig {
+        MilliIndexerConfig {
+            log_every_n: self.mc_log_every_n,
+            max_nb_chunks: self.mc_max_nb_chunks,
+            documents_chunk_size: self.mc_documents_chunk_size,
+            max_memory: self.mc_max_memory,
+            chunk_compression_type: match self.mc_chunk_compression_type {
+                Some(x) => x,
+                None => Default::default(),
+            },
+            chunk_compression_level: self.mc_chunk_compression_level,
+            thread_pool: None,
+            max_positions_per_attributes: self.mc_max_positions_per_attributes,
+            skip_index_budget: match self.mc_skip_index_budget {
+                Some(x) => x,
+                None => false,
+            },
+        }
+    }
+}
+
+impl Into<MilliIndexDocumentsConfig> for &Options {
+    fn into(self) -> MilliIndexDocumentsConfig {
+        MilliIndexDocumentsConfig {
+            words_prefix_threshold: self.mid_doc_words_prefix_threshold,
+            max_prefix_length: self.mid_doc_max_prefix_length,
+            words_positions_level_group_size: self.mid_doc_words_positions_level_group_size,
+            words_positions_min_level_size: self.mid_doc_words_positions_min_level_size,
+            update_method: MilliIndexDocumentsMethod::ReplaceDocuments,
+            autogenerate_docids: false,
+        }
+    }
 }
 
 #[pg_guard]
@@ -548,14 +649,16 @@ pub extern "C" fn amendscan(_scan: pg_sys::IndexScanDesc) {}
 pub enum Error {
     #[error("Failed to split TID serialization, it could be malformed")]
     TidSplit,
-    #[error("Failed to parse TID integer, it could be malformed")]
+    #[error("Failed to parse TID integer, it could be malformed: {0}")]
     TidParseInt(ParseIntError),
-    #[error("Failed to parse index option value from JSON")]
+    #[error("Failed to parse index option value from JSON: {0}")]
     OptionsParseValue(serde_json::Error),
-    #[error("Failed to encode index options to CBOR")]
+    #[error("Failed to encode index options to CBOR: {0}")]
     OptionsEncode(ciborium::ser::Error<io::Error>),
-    #[error("Invalid index options keys")]
+    #[error("Failed to decode index options from CBOR: {0}")]
+    OptionsDecode(ciborium::de::Error<io::Error>),
+    #[error("Invalid index options keys: {0:?}")]
     OptionsInvalidKeys(Vec<String>),
-    #[error("Could not resolve index space OID")]
+    #[error("Could not resolve index space OID: {0}")]
     SpaceResolve(io::Error),
 }
