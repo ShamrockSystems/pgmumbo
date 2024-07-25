@@ -13,7 +13,10 @@ use std::{
 
 use lazy_static::lazy_static;
 use milli::{
-    documents::{DocumentsBatchBuilder, DocumentsBatchReader},
+    documents::{
+        documents_batch_reader_from_objects, DocumentsBatchBuilder, DocumentsBatchReader,
+        PrimaryKey as MilliPrimaryKey,
+    },
     heed::EnvOpenOptions,
     order_by_map::OrderByMap as MilliOrderByMap,
     proximity::ProximityPrecision as MilliProximityPrecision,
@@ -24,7 +27,7 @@ use milli::{
     },
     CompressionType as MilliCompressionType, Criterion as MilliCriterion, Index as MilliIndex,
 };
-use pg_sys::{palloc0, panic::ErrorReportable, ItemPointerData, Oid};
+use pg_sys::{panic::ErrorReportable, Oid};
 use pgrx::{prelude::*, set_varsize_4b, vardata_4b, varsize_4b, PgMemoryContexts, PgRelation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -98,15 +101,15 @@ pub extern "C" fn ambuild(
     let options: Options = index_relation.rd_options.try_into().unwrap_or_report();
 
     let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
-    let mut lmdb_options = EnvOpenOptions::new();
-    lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
-
     info!("Building a new index at: {index_path:?}");
     if index_path.exists() {
         warning!("Existing files in index location that should not be there, deleting them...");
         fs::remove_dir_all(&index_path).unwrap_or_report();
     }
     fs::create_dir_all(&index_path).unwrap_or_report();
+
+    let mut lmdb_options = EnvOpenOptions::new();
+    lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
     let milli_index = MilliIndex::new(lmdb_options, &index_path).unwrap_or_report();
 
     let mut build_state = BuildState {
@@ -235,14 +238,14 @@ fn tid_to_name(ptr: pg_sys::ItemPointer) -> String {
 fn name_to_tid(s: &str) -> Result<pg_sys::ItemPointer, Error> {
     let (blk_str, pos_str) = s.split_once('_').ok_or(Error::TidSplit)?;
     let (blk_hi_str, blk_lo_str) = blk_str.split_once('-').ok_or(Error::TidSplit)?;
-    let item_ptr: *mut ItemPointerData =
-        unsafe { palloc0(mem::size_of::<pg_sys::ItemPointerData>()).cast() };
 
-    unsafe { *item_ptr }.ip_blkid.bi_hi = blk_hi_str.parse().map_err(Error::TidParseInt)?;
-    unsafe { *item_ptr }.ip_blkid.bi_lo = blk_lo_str.parse().map_err(Error::TidParseInt)?;
-    unsafe { *item_ptr }.ip_posid = pos_str.parse().map_err(Error::TidParseInt)?;
-
-    Ok(item_ptr)
+    Ok(&mut pg_sys::ItemPointerData {
+        ip_blkid: pg_sys::BlockIdData {
+            bi_hi: blk_hi_str.parse().map_err(Error::TidParseInt)?,
+            bi_lo: blk_lo_str.parse().map_err(Error::TidParseInt)?,
+        },
+        ip_posid: pos_str.parse().map_err(Error::TidParseInt)?,
+    })
 }
 
 fn form_document(
@@ -341,8 +344,13 @@ pub extern "C" fn aminsert(
     _index_info: *mut pg_sys::IndexInfo,
 ) -> bool {
     info!("pgmumbo aminsert...");
+    let index_relation = unsafe { PgRelation::from_pg(index_relation) };
+    let options: Options = index_relation.rd_options.try_into().unwrap_or_report();
 
-    let desc = unsafe { PgRelation::from_pg(index_relation).rd_att.as_ref() }.unwrap();
+    let mut insert_context = PgMemoryContexts::new(PROGRAM_NAME);
+    let mut old_owned_context = unsafe { insert_context.set_as_current() };
+
+    let desc = unsafe { index_relation.rd_att.as_ref() }.unwrap();
     let natts = desc.natts as usize;
 
     let isnull = unsafe { slice::from_raw_parts(isnull, natts) };
@@ -350,19 +358,97 @@ pub extern "C" fn aminsert(
     let attrs = unsafe { desc.attrs.as_slice(natts) };
 
     let document = form_document(heap_tid, isnull, values, attrs);
+    info!("pgmumbo aminsert: {document:?}");
+    let document_reader = documents_batch_reader_from_objects(iter::once(document));
 
+    // Open the index for each tuple for now... ideally we'd like to cache this, possibly in the index relation
+    let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
+    let mut lmdb_options = EnvOpenOptions::new();
+    lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
+    let milli_index = MilliIndex::new(lmdb_options, index_path).unwrap_or_report();
+
+    // Insert the document into the index
+    let mut wtxn = milli_index.write_txn().unwrap_or_report();
+    let milli_idx_config: MilliIndexerConfig = (&options).into();
+    let milli_idx_doc_config: MilliIndexDocumentsConfig = (&options).into();
+    let indexer = MilliIndexDocuments::new(
+        &mut wtxn,
+        &milli_index,
+        &milli_idx_config,
+        milli_idx_doc_config,
+        |_| {},
+        || false,
+    )
+    .unwrap_or_report();
+    let (indexer, user_error) = indexer.add_documents(document_reader).unwrap_or_report();
+    user_error.unwrap_or_report();
+    indexer.execute().unwrap_or_report();
+    wtxn.commit().unwrap_or_report();
+
+    unsafe {
+        old_owned_context.set_as_current();
+        insert_context.reset();
+    }
     // pgmumbo does not perform uniqueness checks
     false
 }
 
 #[pg_guard]
 pub extern "C" fn ambulkdelete(
-    _info: *mut pg_sys::IndexVacuumInfo,
+    info: *mut pg_sys::IndexVacuumInfo,
     _stats: *mut pg_sys::IndexBulkDeleteResult,
-    _callback: pg_sys::IndexBulkDeleteCallback,
-    _callback_state: *mut ::std::os::raw::c_void,
+    callback: pg_sys::IndexBulkDeleteCallback,
+    callback_state: *mut ::std::os::raw::c_void,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
-    todo!()
+    let callback = callback.unwrap();
+    let index_relation = unsafe { PgRelation::from_pg((*info).index) };
+    let options: Options = index_relation.rd_options.try_into().unwrap_or_report();
+
+    // Open up an index
+    let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
+    let mut lmdb_options = EnvOpenOptions::new();
+    lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
+    let milli_index = MilliIndex::new(lmdb_options, index_path).unwrap_or_report();
+
+    // Gather external document IDs for deletion
+    let mut to_delete = Vec::new();
+    let rtxn = milli_index.read_txn().unwrap_or_report();
+    let milli_index_fields = milli_index.fields_ids_map(&rtxn).unwrap_or_report();
+    let milli_primary_key = MilliPrimaryKey::new(TID_PRIMARY_KEY, &milli_index_fields).unwrap();
+    for document in milli_index.all_documents(&rtxn).unwrap_or_report() {
+        let (_, kv_reader) = document.unwrap_or_report();
+        let pk_value = milli_primary_key
+            .document_id(&kv_reader, &milli_index_fields)
+            .unwrap()
+            .map_err(|_| todo!())
+            .unwrap();
+        let tid = name_to_tid(&pk_value).unwrap_or_report();
+        let should_delete = unsafe { callback(tid, callback_state) };
+        if should_delete {
+            to_delete.push(pk_value);
+        }
+    }
+    rtxn.commit().unwrap_or_report();
+
+    // Delete such documents
+    let mut wtxn = milli_index.write_txn().unwrap_or_report();
+    let milli_idx_config: MilliIndexerConfig = (&options).into();
+    let milli_idx_doc_config: MilliIndexDocumentsConfig = (&options).into();
+    let indexer = MilliIndexDocuments::new(
+        &mut wtxn,
+        &milli_index,
+        &milli_idx_config,
+        milli_idx_doc_config,
+        |_| (),
+        || false,
+    )
+    .unwrap();
+    let (indexer, user_error) = indexer.remove_documents(to_delete).unwrap_or_report();
+    user_error.unwrap_or_report();
+    indexer.execute().unwrap_or_report();
+    wtxn.commit().unwrap_or_report();
+
+    ptr::null_mut()
 }
 
 #[pg_guard]
@@ -370,7 +456,7 @@ pub extern "C" fn amvacuumcleanup(
     _info: *mut pg_sys::IndexVacuumInfo,
     _stats: *mut pg_sys::IndexBulkDeleteResult,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
-    todo!()
+    ptr::null_mut()
 }
 
 #[allow(clippy::too_many_arguments)]
