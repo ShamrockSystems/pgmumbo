@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    ffi::CStr,
+    ffi::{self, CStr},
     fs,
     io::{self, Cursor},
     iter::{self, zip},
@@ -8,7 +8,8 @@ use std::{
     num::{NonZeroU32, ParseIntError},
     os::raw,
     path::{Path, PathBuf},
-    ptr, slice, sync::LazyLock,
+    ptr, slice,
+    sync::LazyLock,
 };
 
 use milli::{
@@ -16,7 +17,7 @@ use milli::{
         documents_batch_reader_from_objects, DocumentsBatchBuilder, DocumentsBatchReader,
         PrimaryKey as MilliPrimaryKey,
     },
-    heed::EnvOpenOptions as MilliEnvOpenOptions,
+    heed::{self, EnvOpenOptions as MilliEnvOpenOptions},
     order_by_map::OrderByMap as MilliOrderByMap,
     proximity::ProximityPrecision as MilliProximityPrecision,
     update::{
@@ -25,6 +26,7 @@ use milli::{
         Settings as MilliSettings,
     },
     CompressionType as MilliCompressionType, Criterion as MilliCriterion, Index as MilliIndex,
+    SearchContext as MilliSearchContext,
 };
 use pg_sys::{panic::ErrorReportable, Oid};
 use pgrx::{prelude::*, set_varsize_4b, vardata_4b, varsize_4b, PgMemoryContexts, PgRelation};
@@ -32,6 +34,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_nested_with::serde_nested;
 use thiserror::Error;
+
+#[macro_use]
+extern crate ouroboros;
 
 pgrx::pg_module_magic!();
 
@@ -342,7 +347,6 @@ pub extern "C" fn aminsert(
     _index_unchanged: bool,
     _index_info: *mut pg_sys::IndexInfo,
 ) -> bool {
-    info!("pgmumbo aminsert...");
     let index_relation = unsafe { PgRelation::from_pg(index_relation) };
     let options: Options = index_relation.rd_options.try_into().unwrap_or_report();
 
@@ -429,6 +433,8 @@ pub extern "C" fn ambulkdelete(
     }
     rtxn.commit().unwrap_or_report();
 
+    info!("pg ambulkdelete: deleting {} documents", to_delete.len());
+
     // Delete such documents
     let mut wtxn = milli_index.write_txn().unwrap_or_report();
     let milli_idx_config: MilliIndexerConfig = (&options).into();
@@ -477,12 +483,12 @@ pub extern "C" fn amcostestimate(
 #[derive(Serialize, Deserialize)]
 #[serde(remote = "MilliCompressionType")]
 enum MilliCompressionTypeDef {
-    None = 0,
-    SnappyPre05 = 1,
-    Zlib = 2,
-    Lz4 = 3,
-    Zstd = 4,
-    Snappy = 5,
+    None,
+    SnappyPre05,
+    Zlib,
+    Lz4,
+    Zstd,
+    Snappy,
 }
 
 #[serde_nested]
@@ -700,25 +706,68 @@ pub extern "C" fn amvalidate(_opclassoid: Oid) -> bool {
     true
 }
 
+#[self_referencing]
+struct ScanState {
+    milli_index: MilliIndex,
+    #[borrows(milli_index)]
+    #[covariant]
+    lmdb_rtxn: heed::RoTxn<'this>,
+    #[borrows(milli_index, lmdb_rtxn)]
+    #[covariant]
+    milli_context: MilliSearchContext<'this>,
+}
+
 #[pg_guard]
 pub extern "C" fn ambeginscan(
-    _index_relation: pg_sys::Relation,
-    _nkeys: ::std::os::raw::c_int,
-    _norderbys: ::std::os::raw::c_int,
+    index_relation: pg_sys::Relation,
+    nkeys: ::std::os::raw::c_int,
+    norderbys: ::std::os::raw::c_int,
 ) -> pg_sys::IndexScanDesc {
     info!("pgmumbo ambeginscan");
-    todo!()
+    let mut scan = unsafe {
+        PgBox::from_pg(pg_sys::RelationGetIndexScan(
+            index_relation,
+            nkeys,
+            norderbys,
+        ))
+    };
+    let index_relation = unsafe { PgRelation::from_pg(index_relation) };
+
+    // Open up an index
+    let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
+    let mut lmdb_options = MilliEnvOpenOptions::new();
+    lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
+    let milli_index = MilliIndex::new(lmdb_options, index_path).unwrap_or_report();
+    // Initialize scan state
+    let state = ScanStateBuilder {
+        milli_index,
+        // Open an LMDB read transaction
+        lmdb_rtxn_builder: |milli_index| milli_index.read_txn().unwrap_or_report(),
+        // Open up a search context
+        milli_context_builder: |milli_index, lmdb_rtxn| {
+            MilliSearchContext::new(milli_index, lmdb_rtxn).unwrap_or_report()
+        },
+    }
+    .build();
+    scan.opaque =
+        PgMemoryContexts::CacheMemoryContext.leak_and_drop_on_delete(state) as *mut ffi::c_void;
+
+    scan.into_pg()
 }
 
 #[pg_guard]
 pub extern "C" fn amrescan(
-    _scan: pg_sys::IndexScanDesc,
-    _keys: pg_sys::ScanKey,
+    scan: pg_sys::IndexScanDesc,
+    keys: pg_sys::ScanKey,
     _nkeys: ::std::os::raw::c_int,
-    _orderbys: pg_sys::ScanKey,
+    orderbys: pg_sys::ScanKey,
     _norderbys: ::std::os::raw::c_int,
 ) {
     info!("pgmumbo amrescan");
+    let mut scan = unsafe { PgBox::from_pg(scan) };
+
+    // Need to restart scan with new values
+    if !keys.is_null() && !orderbys.is_null() {}
 }
 
 // #[pg_guard]
