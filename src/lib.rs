@@ -13,20 +13,8 @@ use std::{
 };
 
 use milli::{
-    documents::{
-        documents_batch_reader_from_objects, DocumentsBatchBuilder, DocumentsBatchReader,
-        PrimaryKey as MilliPrimaryKey,
-    },
-    heed::{self, EnvOpenOptions as MilliEnvOpenOptions},
-    order_by_map::OrderByMap as MilliOrderByMap,
-    proximity::ProximityPrecision as MilliProximityPrecision,
-    update::{
-        IndexDocuments as MilliIndexDocuments, IndexDocumentsConfig as MilliIndexDocumentsConfig,
-        IndexDocumentsMethod as MilliIndexDocumentsMethod, IndexerConfig as MilliIndexerConfig,
-        Settings as MilliSettings,
-    },
-    CompressionType as MilliCompressionType, Criterion as MilliCriterion, Index as MilliIndex,
-    SearchContext as MilliSearchContext,
+    documents::{documents_batch_reader_from_objects, DocumentsBatchBuilder, DocumentsBatchReader},
+    heed,
 };
 use pg_sys::{panic::ErrorReportable, Oid};
 use pgrx::{prelude::*, set_varsize_4b, vardata_4b, varsize_4b, PgMemoryContexts, PgRelation};
@@ -112,9 +100,9 @@ pub extern "C" fn ambuild(
     }
     fs::create_dir_all(&index_path).unwrap_or_report();
 
-    let mut lmdb_options = MilliEnvOpenOptions::new();
+    let mut lmdb_options = heed::EnvOpenOptions::new();
     lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
-    let milli_index = MilliIndex::new(lmdb_options, &index_path).unwrap_or_report();
+    let milli_index = milli::Index::new(lmdb_options, &index_path).unwrap_or_report();
 
     let mut build_state = BuildState {
         owned_context: PgMemoryContexts::new(PROGRAM_NAME),
@@ -134,9 +122,10 @@ pub extern "C" fn ambuild(
     let documents = build_state.batch_builder.into_inner().unwrap_or_report();
     let mut wtxn = milli_index.write_txn().unwrap_or_report();
 
-    let milli_idx_config: MilliIndexerConfig = (&options).into();
-    let milli_idx_doc_config: MilliIndexDocumentsConfig = (&options).into();
-    let mut milli_settings = MilliSettings::new(&mut wtxn, &milli_index, &milli_idx_config);
+    let milli_idx_config: milli::update::IndexerConfig = (&options).into();
+    let milli_idx_doc_config: milli::update::IndexDocumentsConfig = (&options).into();
+    let mut milli_settings =
+        milli::update::Settings::new(&mut wtxn, &milli_index, &milli_idx_config);
     milli_settings.set_primary_key(TID_PRIMARY_KEY.to_string());
     macro_rules! set_ms_option {
         ($option:ident, $method:ident) => {
@@ -168,7 +157,7 @@ pub extern "C" fn ambuild(
     set_ms_option!(ms_search_cutoff, set_search_cutoff);
     milli_settings.execute(|_| {}, || false).unwrap();
 
-    let mut indexer = MilliIndexDocuments::new(
+    let mut indexer = milli::update::IndexDocuments::new(
         &mut wtxn,
         &milli_index,
         &milli_idx_config,
@@ -366,15 +355,15 @@ pub extern "C" fn aminsert(
 
     // Open the index for each tuple for now... ideally we'd like to cache this, possibly in the index relation
     let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
-    let mut lmdb_options = MilliEnvOpenOptions::new();
+    let mut lmdb_options = heed::EnvOpenOptions::new();
     lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
-    let milli_index = MilliIndex::new(lmdb_options, index_path).unwrap_or_report();
+    let milli_index = milli::Index::new(lmdb_options, index_path).unwrap_or_report();
 
     // Insert the document into the index
     let mut wtxn = milli_index.write_txn().unwrap_or_report();
-    let milli_idx_config: MilliIndexerConfig = (&options).into();
-    let milli_idx_doc_config: MilliIndexDocumentsConfig = (&options).into();
-    let indexer = MilliIndexDocuments::new(
+    let milli_idx_config: milli::update::IndexerConfig = (&options).into();
+    let milli_idx_doc_config: milli::update::IndexDocumentsConfig = (&options).into();
+    let indexer = milli::update::IndexDocuments::new(
         &mut wtxn,
         &milli_index,
         &milli_idx_config,
@@ -409,15 +398,16 @@ pub extern "C" fn ambulkdelete(
 
     // Open up an index
     let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
-    let mut lmdb_options = MilliEnvOpenOptions::new();
+    let mut lmdb_options = heed::EnvOpenOptions::new();
     lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
-    let milli_index = MilliIndex::new(lmdb_options, index_path).unwrap_or_report();
+    let milli_index = milli::Index::new(lmdb_options, index_path).unwrap_or_report();
 
     // Gather external document IDs for deletion
     let mut to_delete = Vec::new();
     let rtxn = milli_index.read_txn().unwrap_or_report();
     let milli_index_fields = milli_index.fields_ids_map(&rtxn).unwrap_or_report();
-    let milli_primary_key = MilliPrimaryKey::new(TID_PRIMARY_KEY, &milli_index_fields).unwrap();
+    let milli_primary_key =
+        milli::documents::PrimaryKey::new(TID_PRIMARY_KEY, &milli_index_fields).unwrap();
     for document in milli_index.all_documents(&rtxn).unwrap_or_report() {
         let (_, kv_reader) = document.unwrap_or_report();
         let pk_value = milli_primary_key
@@ -437,9 +427,9 @@ pub extern "C" fn ambulkdelete(
 
     // Delete such documents
     let mut wtxn = milli_index.write_txn().unwrap_or_report();
-    let milli_idx_config: MilliIndexerConfig = (&options).into();
-    let milli_idx_doc_config: MilliIndexDocumentsConfig = (&options).into();
-    let indexer = MilliIndexDocuments::new(
+    let milli_idx_config: milli::update::IndexerConfig = (&options).into();
+    let milli_idx_doc_config: milli::update::IndexDocumentsConfig = (&options).into();
+    let indexer = milli::update::IndexDocuments::new(
         &mut wtxn,
         &milli_index,
         &milli_idx_config,
@@ -481,7 +471,7 @@ pub extern "C" fn amcostestimate(
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(remote = "MilliCompressionType")]
+#[serde(remote = "milli::CompressionType")]
 enum MilliCompressionTypeDef {
     None,
     SnappyPre05,
@@ -500,8 +490,11 @@ struct Options {
     mc_documents_chunk_size: Option<usize>,
     mc_max_memory: Option<usize>,
     #[serde(default)]
-    #[serde_nested(sub = "MilliCompressionType", serde(with = "MilliCompressionTypeDef"))]
-    mc_chunk_compression_type: Option<MilliCompressionType>,
+    #[serde_nested(
+        sub = "milli::CompressionType",
+        serde(with = "MilliCompressionTypeDef")
+    )]
+    mc_chunk_compression_type: Option<milli::CompressionType>,
     mc_chunk_compression_level: Option<u32>,
     mc_max_positions_per_attributes: Option<u32>,
     mc_skip_index_budget: Option<bool>,
@@ -510,7 +503,7 @@ struct Options {
     ms_displayed_fields: Option<Vec<String>>,
     ms_filterable_fields: Option<HashSet<String>>,
     ms_sortable_fields: Option<HashSet<String>>,
-    ms_criteria: Option<Vec<MilliCriterion>>,
+    ms_criteria: Option<Vec<milli::Criterion>>,
     ms_stop_words: Option<BTreeSet<String>>,
     ms_non_separator_tokens: Option<BTreeSet<String>>,
     ms_separator_tokens: Option<BTreeSet<String>>,
@@ -523,9 +516,9 @@ struct Options {
     ms_exact_words: Option<BTreeSet<String>>,
     ms_exact_attributes: Option<HashSet<String>>,
     ms_max_values_per_facet: Option<usize>,
-    ms_sort_facet_values_by: Option<MilliOrderByMap>,
+    ms_sort_facet_values_by: Option<milli::order_by_map::OrderByMap>,
     ms_pagination_max_total_hits: Option<usize>,
-    ms_proximity_precision: Option<MilliProximityPrecision>,
+    ms_proximity_precision: Option<milli::proximity::ProximityPrecision>,
     ms_search_cutoff: Option<u64>,
     // Unmanaged MilliIndexDocumentsConfig fields
     mid_doc_words_prefix_threshold: Option<u32>,
@@ -671,9 +664,9 @@ impl TryFrom<*mut pg_sys::varlena> for Options {
     }
 }
 
-impl From<&Options> for MilliIndexerConfig {
+impl From<&Options> for milli::update::IndexerConfig {
     fn from(val: &Options) -> Self {
-        MilliIndexerConfig {
+        milli::update::IndexerConfig {
             log_every_n: val.mc_log_every_n,
             max_nb_chunks: val.mc_max_nb_chunks,
             documents_chunk_size: val.mc_documents_chunk_size,
@@ -687,14 +680,14 @@ impl From<&Options> for MilliIndexerConfig {
     }
 }
 
-impl From<&Options> for MilliIndexDocumentsConfig {
+impl From<&Options> for milli::update::IndexDocumentsConfig {
     fn from(val: &Options) -> Self {
-        MilliIndexDocumentsConfig {
+        milli::update::IndexDocumentsConfig {
             words_prefix_threshold: val.mid_doc_words_prefix_threshold,
             max_prefix_length: val.mid_doc_max_prefix_length,
             words_positions_level_group_size: val.mid_doc_words_positions_level_group_size,
             words_positions_min_level_size: val.mid_doc_words_positions_min_level_size,
-            update_method: MilliIndexDocumentsMethod::ReplaceDocuments,
+            update_method: milli::update::IndexDocumentsMethod::ReplaceDocuments,
             autogenerate_docids: false,
         }
     }
@@ -706,15 +699,21 @@ pub extern "C" fn amvalidate(_opclassoid: Oid) -> bool {
     true
 }
 
+const SCAN_RESULT_SIZE: usize = 20;
+
 #[self_referencing]
 struct ScanState {
-    milli_index: MilliIndex,
+    milli_index: milli::Index,
     #[borrows(milli_index)]
     #[covariant]
     lmdb_rtxn: heed::RoTxn<'this>,
     #[borrows(milli_index, lmdb_rtxn)]
     #[covariant]
-    milli_context: MilliSearchContext<'this>,
+    milli_context: milli::SearchContext<'this>,
+    // Batch up paginated search results in a Vec
+    search_page: Vec<milli::DocumentId>,
+    // Use as a global id to support forward/backward scans across pages
+    search_idx: usize,
 }
 
 #[pg_guard]
@@ -735,22 +734,25 @@ pub extern "C" fn ambeginscan(
 
     // Open up an index
     let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
-    let mut lmdb_options = MilliEnvOpenOptions::new();
+    let mut lmdb_options = heed::EnvOpenOptions::new();
     lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
-    let milli_index = MilliIndex::new(lmdb_options, index_path).unwrap_or_report();
+    let milli_index = milli::Index::new(lmdb_options, index_path).unwrap_or_report();
     // Initialize scan state
-    let state = ScanStateBuilder {
+    let state_builder = ScanStateBuilder {
         milli_index,
         // Open an LMDB read transaction
         lmdb_rtxn_builder: |milli_index| milli_index.read_txn().unwrap_or_report(),
         // Open up a search context
         milli_context_builder: |milli_index, lmdb_rtxn| {
-            MilliSearchContext::new(milli_index, lmdb_rtxn).unwrap_or_report()
+            milli::SearchContext::new(milli_index, lmdb_rtxn).unwrap_or_report()
         },
-    }
-    .build();
+        search_page: Vec::default(),
+        search_idx: 0,
+    };
+    // Load the state into the scan description
+    let mut state = state_builder.build();
     scan.opaque =
-        PgMemoryContexts::CacheMemoryContext.leak_and_drop_on_delete(state) as *mut ffi::c_void;
+        unsafe { PgBox::<ScanState>::from_rust(&mut state) }.into_pg() as *mut ffi::c_void;
 
     scan.into_pg()
 }
@@ -764,10 +766,45 @@ pub extern "C" fn amrescan(
     _norderbys: ::std::os::raw::c_int,
 ) {
     info!("pgmumbo amrescan");
-    let mut scan = unsafe { PgBox::from_pg(scan) };
+    let scan = unsafe { PgBox::from_pg(scan) };
+    let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
 
-    // Need to restart scan with new values
-    if !keys.is_null() && !orderbys.is_null() {}
+    // Need to restart scan with new values, TODO limit universe and apply settings
+    // if !keys.is_null() && !orderbys.is_null() {}
+
+    // execute_search allows as to both paginate forwards and backwards on results in the same rtxn
+    // so it enables us to support both linear scans and bitmaps
+    //
+    // if ambitmapscan, then we translate the universe into TIDBitmap
+    // if amgettuple, then we increase or decrease the search_idx, and grab a new cached page if needed
+
+    let universe = state
+        .borrow_milli_index()
+        .documents_ids(state.borrow_lmdb_rtxn())
+        .unwrap_or_report();
+
+    state.with_mut(|state| {
+        let documents = milli::execute_search(
+            state.milli_context,
+            None,
+            milli::TermsMatchingStrategy::Last,
+            milli::score_details::ScoringStrategy::Skip,
+            false,
+            universe,
+            &None,
+            &None,
+            milli::GeoSortStrategy::default(),
+            0,
+            20,
+            None,
+            &mut milli::DefaultSearchLogger,
+            &mut milli::DefaultSearchLogger,
+            milli::TimeBudget::max(),
+            None,
+        )
+        .unwrap_or_report();
+        *state.search_page = documents.documents_ids;
+    });
 }
 
 // #[pg_guard]
@@ -784,8 +821,19 @@ pub extern "C" fn amrescan(
 // }
 
 #[pg_guard]
-pub extern "C" fn amendscan(_scan: pg_sys::IndexScanDesc) {
+pub extern "C" fn amendscan(scan: pg_sys::IndexScanDesc) {
     info!("pgmumbo amendscan");
+    let scan = unsafe { PgBox::from_pg(scan) };
+    {
+        let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
+        // Close out read transaction
+        state.with_mut(|state| {
+            unsafe { ptr::read(state.lmdb_rtxn) }
+                .commit()
+                .unwrap_or_report();
+        });
+    }
+    unsafe { pg_sys::pfree(scan.opaque) };
 }
 
 #[derive(Error, Debug)]
