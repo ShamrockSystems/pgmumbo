@@ -233,8 +233,8 @@ fn tid_to_name(ptr: pg_sys::ItemPointer) -> String {
 }
 
 fn name_to_tid(s: &str) -> Result<pg_sys::ItemPointer, Error> {
-    let (blk_str, pos_str) = s.split_once("_").ok_or(Error::TidSplit)?;
-    let (blk_hi_str, blk_lo_str) = blk_str.split_once("-").ok_or(Error::TidSplit)?;
+    let (blk_str, pos_str) = s.split_once('_').ok_or(Error::TidSplit)?;
+    let (blk_hi_str, blk_lo_str) = blk_str.split_once('-').ok_or(Error::TidSplit)?;
     let item_ptr: *mut ItemPointerData =
         unsafe { palloc0(mem::size_of::<pg_sys::ItemPointerData>()).cast() };
 
@@ -328,6 +328,7 @@ pub extern "C" fn ambuildempty(_index_relation: pg_sys::Relation) {
     info!("pgmumbo ambuildempty");
 }
 
+#[allow(clippy::too_many_arguments)]
 #[pg_guard]
 pub extern "C" fn aminsert(
     index_relation: pg_sys::Relation,
@@ -372,6 +373,7 @@ pub extern "C" fn amvacuumcleanup(
     todo!()
 }
 
+#[allow(clippy::too_many_arguments)]
 #[pg_guard(immutable, parallel_safe)]
 pub extern "C" fn amcostestimate(
     _root: *mut pg_sys::PlannerInfo,
@@ -577,35 +579,29 @@ impl TryFrom<*mut pg_sys::varlena> for Options {
     }
 }
 
-impl Into<MilliIndexerConfig> for &Options {
-    fn into(self) -> MilliIndexerConfig {
+impl From<&Options> for MilliIndexerConfig {
+    fn from(val: &Options) -> Self {
         MilliIndexerConfig {
-            log_every_n: self.mc_log_every_n,
-            max_nb_chunks: self.mc_max_nb_chunks,
-            documents_chunk_size: self.mc_documents_chunk_size,
-            max_memory: self.mc_max_memory,
-            chunk_compression_type: match self.mc_chunk_compression_type {
-                Some(x) => x,
-                None => Default::default(),
-            },
-            chunk_compression_level: self.mc_chunk_compression_level,
+            log_every_n: val.mc_log_every_n,
+            max_nb_chunks: val.mc_max_nb_chunks,
+            documents_chunk_size: val.mc_documents_chunk_size,
+            max_memory: val.mc_max_memory,
+            chunk_compression_type: val.mc_chunk_compression_type.unwrap_or_default(),
+            chunk_compression_level: val.mc_chunk_compression_level,
             thread_pool: None,
-            max_positions_per_attributes: self.mc_max_positions_per_attributes,
-            skip_index_budget: match self.mc_skip_index_budget {
-                Some(x) => x,
-                None => false,
-            },
+            max_positions_per_attributes: val.mc_max_positions_per_attributes,
+            skip_index_budget: val.mc_skip_index_budget.unwrap_or(false),
         }
     }
 }
 
-impl Into<MilliIndexDocumentsConfig> for &Options {
-    fn into(self) -> MilliIndexDocumentsConfig {
+impl From<&Options> for MilliIndexDocumentsConfig {
+    fn from(val: &Options) -> Self {
         MilliIndexDocumentsConfig {
-            words_prefix_threshold: self.mid_doc_words_prefix_threshold,
-            max_prefix_length: self.mid_doc_max_prefix_length,
-            words_positions_level_group_size: self.mid_doc_words_positions_level_group_size,
-            words_positions_min_level_size: self.mid_doc_words_positions_min_level_size,
+            words_prefix_threshold: val.mid_doc_words_prefix_threshold,
+            max_prefix_length: val.mid_doc_max_prefix_length,
+            words_positions_level_group_size: val.mid_doc_words_positions_level_group_size,
+            words_positions_min_level_size: val.mid_doc_words_positions_min_level_size,
             update_method: MilliIndexDocumentsMethod::ReplaceDocuments,
             autogenerate_docids: false,
         }
