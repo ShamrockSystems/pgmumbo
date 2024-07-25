@@ -190,7 +190,7 @@ struct BuildState {
 }
 
 #[pg_guard]
-unsafe extern "C" fn build_callback(
+extern "C" fn build_callback(
     index: pg_sys::Relation,
     tid: pg_sys::ItemPointer,
     values: *mut pg_sys::Datum,
@@ -198,17 +198,17 @@ unsafe extern "C" fn build_callback(
     _tuple_is_alive: bool,
     state: *mut std::os::raw::c_void,
 ) {
-    let build_state = (state as *mut BuildState).as_mut().unwrap();
-    let mut old_owned_context = build_state.owned_context.set_as_current();
+    let build_state = unsafe { (state as *mut BuildState).as_mut() }.unwrap();
+    let mut old_owned_context = unsafe { build_state.owned_context.set_as_current() };
 
-    let desc = (*index).rd_att.as_ref().unwrap();
+    let desc = unsafe { PgRelation::from_pg(index).rd_att.as_ref() }.unwrap();
     let natts = desc.natts as usize;
 
-    let isnull = slice::from_raw_parts(isnull, natts);
-    let attrs = desc.attrs.as_slice(natts);
-    let values = slice::from_raw_parts(values, natts);
+    let isnull = unsafe { slice::from_raw_parts(isnull, natts) };
+    let values = unsafe { slice::from_raw_parts(values, natts) };
+    let attrs = unsafe { desc.attrs.as_slice(natts) };
 
-    let document = form_document(tid, isnull, attrs, values);
+    let document = form_document(tid, isnull, values, attrs);
 
     info!("pgmumbo heapscan: {document:?}");
 
@@ -217,8 +217,10 @@ unsafe extern "C" fn build_callback(
         .append_json_object(&document)
         .unwrap_or_report();
 
-    old_owned_context.set_as_current();
-    build_state.owned_context.reset();
+    unsafe {
+        old_owned_context.set_as_current();
+        build_state.owned_context.reset();
+    }
 }
 
 fn tid_to_name(ptr: pg_sys::ItemPointer) -> String {
@@ -246,8 +248,8 @@ fn name_to_tid(s: &str) -> Result<pg_sys::ItemPointer, Error> {
 fn form_document(
     tid: pg_sys::ItemPointer,
     isnull: &[bool],
-    attrs: &[pg_sys::FormData_pg_attribute],
     values: &[pg_sys::Datum],
+    attrs: &[pg_sys::FormData_pg_attribute],
 ) -> serde_json::Map<String, serde_json::Value> {
     serde_json::Map::from_iter(
         // Managed primary key; 1:1 mapping with TID
@@ -327,11 +329,11 @@ pub extern "C" fn ambuildempty(_index_relation: pg_sys::Relation) {
 }
 
 #[pg_guard]
-pub unsafe extern "C" fn aminsert(
-    _index_relation: pg_sys::Relation,
-    _values: *mut pg_sys::Datum,
-    _isnull: *mut bool,
-    _heap_tid: pg_sys::ItemPointer,
+pub extern "C" fn aminsert(
+    index_relation: pg_sys::Relation,
+    values: *mut pg_sys::Datum,
+    isnull: *mut bool,
+    heap_tid: pg_sys::ItemPointer,
     _heap_relation: pg_sys::Relation,
     _check_unique: pg_sys::IndexUniqueCheck::Type,
     _index_unchanged: bool,
@@ -339,7 +341,17 @@ pub unsafe extern "C" fn aminsert(
 ) -> bool {
     info!("pgmumbo aminsert...");
 
-    todo!()
+    let desc = unsafe { PgRelation::from_pg(index_relation).rd_att.as_ref() }.unwrap();
+    let natts = desc.natts as usize;
+
+    let isnull = unsafe { slice::from_raw_parts(isnull, natts) };
+    let values = unsafe { slice::from_raw_parts(values, natts) };
+    let attrs = unsafe { desc.attrs.as_slice(natts) };
+
+    let document = form_document(heap_tid, isnull, values, attrs);
+
+    // pgmumbo does not perform uniqueness checks
+    false
 }
 
 #[pg_guard]
@@ -361,7 +373,7 @@ pub extern "C" fn amvacuumcleanup(
 }
 
 #[pg_guard(immutable, parallel_safe)]
-pub unsafe extern "C" fn amcostestimate(
+pub extern "C" fn amcostestimate(
     _root: *mut pg_sys::PlannerInfo,
     _path: *mut pg_sys::IndexPath,
     _loop_count: f64,
