@@ -8,10 +8,9 @@ use std::{
     num::{NonZeroU32, ParseIntError},
     os::raw,
     path::{Path, PathBuf},
-    ptr, slice,
+    ptr, slice, sync::LazyLock,
 };
 
-use lazy_static::lazy_static;
 use milli::{
     documents::{
         documents_batch_reader_from_objects, DocumentsBatchBuilder, DocumentsBatchReader,
@@ -456,6 +455,7 @@ pub extern "C" fn amvacuumcleanup(
     _info: *mut pg_sys::IndexVacuumInfo,
     _stats: *mut pg_sys::IndexBulkDeleteResult,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
+    info!("pgmumbo amvacuumcleanup");
     ptr::null_mut()
 }
 
@@ -471,6 +471,7 @@ pub extern "C" fn amcostestimate(
     _index_correlation: *mut f64,
     _index_pages: *mut f64,
 ) {
+    info!("pgmumbo amcostestimate");
 }
 
 #[derive(Serialize, Deserialize)]
@@ -525,15 +526,6 @@ struct Options {
     mid_doc_max_prefix_length: Option<usize>,
     mid_doc_words_positions_level_group_size: Option<NonZeroU32>,
     mid_doc_words_positions_min_level_size: Option<NonZeroU32>,
-}
-
-lazy_static! {
-    static ref options_field_names: HashSet<String> =
-        if let Value::Object(map) = serde_json::to_value(Options::default()).unwrap() {
-            map.keys().cloned().collect()
-        } else {
-            panic!()
-        };
 }
 
 #[pg_guard]
@@ -603,6 +595,14 @@ pub extern "C" fn amoptions(reloptions: pg_sys::Datum, validate: bool) -> *mut p
     encoded.into_pg()
 }
 
+static OPTIONS_FIELD_NAMES: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    if let Value::Object(map) = serde_json::to_value(Options::default()).unwrap() {
+        map.keys().cloned().collect()
+    } else {
+        panic!()
+    }
+});
+
 fn encode_options(
     validate: bool,
     elems: &[pg_sys::Datum],
@@ -629,7 +629,7 @@ fn encode_options(
     if validate {
         let difference: Vec<_> = options_map
             .keys()
-            .filter(|key| !options_field_names.contains(*key))
+            .filter(|key| !OPTIONS_FIELD_NAMES.contains(*key))
             .cloned()
             .collect();
         if !difference.is_empty() {
@@ -696,6 +696,7 @@ impl From<&Options> for MilliIndexDocumentsConfig {
 
 #[pg_guard]
 pub extern "C" fn amvalidate(_opclassoid: pg_sys::Oid) -> bool {
+    info!("pgmumbo amvalidate");
     true
 }
 
@@ -705,6 +706,7 @@ pub extern "C" fn ambeginscan(
     _nkeys: ::std::os::raw::c_int,
     _norderbys: ::std::os::raw::c_int,
 ) -> pg_sys::IndexScanDesc {
+    info!("pgmumbo ambeginscan");
     todo!()
 }
 
@@ -716,6 +718,7 @@ pub extern "C" fn amrescan(
     _orderbys: pg_sys::ScanKey,
     _norderbys: ::std::os::raw::c_int,
 ) {
+    info!("pgmumbo amrescan");
 }
 
 // #[pg_guard]
@@ -732,7 +735,9 @@ pub extern "C" fn amrescan(
 // }
 
 #[pg_guard]
-pub extern "C" fn amendscan(_scan: pg_sys::IndexScanDesc) {}
+pub extern "C" fn amendscan(_scan: pg_sys::IndexScanDesc) {
+    info!("pgmumbo amendscan");
+}
 
 #[derive(Error, Debug)]
 pub enum Error {
