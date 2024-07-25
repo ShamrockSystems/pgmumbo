@@ -16,7 +16,7 @@ use milli::{
         documents_batch_reader_from_objects, DocumentsBatchBuilder, DocumentsBatchReader,
         PrimaryKey as MilliPrimaryKey,
     },
-    heed::EnvOpenOptions,
+    heed::EnvOpenOptions as MilliEnvOpenOptions,
     order_by_map::OrderByMap as MilliOrderByMap,
     proximity::ProximityPrecision as MilliProximityPrecision,
     update::{
@@ -107,7 +107,7 @@ pub extern "C" fn ambuild(
     }
     fs::create_dir_all(&index_path).unwrap_or_report();
 
-    let mut lmdb_options = EnvOpenOptions::new();
+    let mut lmdb_options = MilliEnvOpenOptions::new();
     lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
     let milli_index = MilliIndex::new(lmdb_options, &index_path).unwrap_or_report();
 
@@ -362,7 +362,7 @@ pub extern "C" fn aminsert(
 
     // Open the index for each tuple for now... ideally we'd like to cache this, possibly in the index relation
     let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
-    let mut lmdb_options = EnvOpenOptions::new();
+    let mut lmdb_options = MilliEnvOpenOptions::new();
     lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
     let milli_index = MilliIndex::new(lmdb_options, index_path).unwrap_or_report();
 
@@ -405,7 +405,7 @@ pub extern "C" fn ambulkdelete(
 
     // Open up an index
     let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
-    let mut lmdb_options = EnvOpenOptions::new();
+    let mut lmdb_options = MilliEnvOpenOptions::new();
     lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
     let milli_index = MilliIndex::new(lmdb_options, index_path).unwrap_or_report();
 
@@ -695,7 +695,7 @@ impl From<&Options> for MilliIndexDocumentsConfig {
 }
 
 #[pg_guard]
-pub extern "C" fn amvalidate(_opclassoid: pg_sys::Oid) -> bool {
+pub extern "C" fn amvalidate(_opclassoid: Oid) -> bool {
     info!("pgmumbo amvalidate");
     true
 }
