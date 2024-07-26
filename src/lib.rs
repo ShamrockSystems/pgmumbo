@@ -36,12 +36,16 @@ pub extern "C" fn _PG_init() {
     info!("{PROGRAM_NAME} loaded");
 }
 
+// Not sure if pgrx allows for custom return types without overriding SQL.
+// Postgres expects the amhandler to return index_am_handler
 #[pg_extern(sql = "
     CREATE OR REPLACE FUNCTION pgmumbo_amhandler(internal) RETURNS index_am_handler
         STRICT
         LANGUAGE c
         AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';")]
-fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine> {
+fn amhandler(
+    _fcinfo: pg_sys::FunctionCallInfo,
+) -> PgBox<name!(index_am_handler, pg_sys::IndexAmRoutine)> {
     let mut amroutine =
         unsafe { PgBox::<pg_sys::IndexAmRoutine>::alloc_node(pg_sys::NodeTag::T_IndexAmRoutine) };
 
@@ -75,6 +79,9 @@ const INITIAL_LMDB_MMAP_SIZE: usize = 64 * 1024 * 1024 * 1024; // Initialize LMD
 
 const TID_PRIMARY_KEY: &str = "@pgmumbo_tid";
 
+// Called on CREATE INDEX.
+// I'm pretty sure REINDEX just creates a new index relations with a different Oid,
+// so Postgres should handle that for us. When the original index is DROP'ed though can we hook into that?
 #[pg_guard]
 pub extern "C" fn ambuild(
     heap_relation: pg_sys::Relation,
@@ -714,6 +721,8 @@ struct ScanState {
     search_page: Vec<milli::DocumentId>,
     // Use as a global id to support forward/backward scans across pages
     search_idx: usize,
+    // Storage for ammarkpos and amrestrpos
+    marked_idx: Option<usize>,
 }
 
 #[pg_guard]
@@ -748,6 +757,7 @@ pub extern "C" fn ambeginscan(
         },
         search_page: Vec::default(),
         search_idx: 0,
+        marked_idx: None,
     };
     // Load the state into the scan description
     let mut state = state_builder.build();
