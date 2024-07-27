@@ -4,9 +4,7 @@ use std::{
     fs,
     io::{self, Cursor},
     iter::{self, zip},
-    mem,
     num::{NonZeroU32, ParseIntError},
-    os::raw,
     path::{Path, PathBuf},
     ptr, slice,
     sync::LazyLock,
@@ -17,7 +15,8 @@ use milli::{
     heed,
 };
 use pg_sys::{panic::ErrorReportable, Oid};
-use pgrx::{prelude::*, set_varsize_4b, vardata_4b, varsize_4b, PgMemoryContexts, PgRelation};
+use pgrx::{datum, prelude::*, vardata_4b, varsize_4b, PgMemoryContexts, PgRelation};
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_nested_with::serde_nested;
@@ -95,7 +94,7 @@ pub extern "C" fn ambuild(
 
     assert!(index_relation.is_index());
 
-    // TODO setup abort callback
+    // Heed's Drop for LMDB RoTxn and RwTxn should call abort() on an open transaction.
 
     let options: Options = index_relation.rd_options.try_into().unwrap_or_report();
 
@@ -388,6 +387,7 @@ pub extern "C" fn aminsert(
         old_owned_context.set_as_current();
         insert_context.reset();
     }
+
     // pgmumbo does not perform uniqueness checks
     false
 }
@@ -395,13 +395,19 @@ pub extern "C" fn aminsert(
 #[pg_guard]
 pub extern "C" fn ambulkdelete(
     info: *mut pg_sys::IndexVacuumInfo,
-    _stats: *mut pg_sys::IndexBulkDeleteResult,
+    stats: *mut pg_sys::IndexBulkDeleteResult,
     callback: pg_sys::IndexBulkDeleteCallback,
     callback_state: *mut ::std::os::raw::c_void,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
     let callback = callback.unwrap();
     let index_relation = unsafe { PgRelation::from_pg((*info).index) };
     let options: Options = index_relation.rd_options.try_into().unwrap_or_report();
+
+    let stats = if stats.is_null() {
+        unsafe { PgBox::<pg_sys::IndexBulkDeleteResult>::alloc0() }.into_pg_boxed()
+    } else {
+        unsafe { PgBox::from_pg(stats) }
+    };
 
     // Open up an index
     let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
@@ -411,11 +417,11 @@ pub extern "C" fn ambulkdelete(
 
     // Gather external document IDs for deletion
     let mut to_delete = Vec::new();
-    let rtxn = milli_index.read_txn().unwrap_or_report();
-    let milli_index_fields = milli_index.fields_ids_map(&rtxn).unwrap_or_report();
+    let mut wtxn = milli_index.write_txn().unwrap_or_report();
+    let milli_index_fields = milli_index.fields_ids_map(&wtxn).unwrap_or_report();
     let milli_primary_key =
         milli::documents::PrimaryKey::new(TID_PRIMARY_KEY, &milli_index_fields).unwrap();
-    for document in milli_index.all_documents(&rtxn).unwrap_or_report() {
+    for document in milli_index.all_documents(&wtxn).unwrap_or_report() {
         let (_, kv_reader) = document.unwrap_or_report();
         let pk_value = milli_primary_key
             .document_id(&kv_reader, &milli_index_fields)
@@ -428,12 +434,10 @@ pub extern "C" fn ambulkdelete(
             to_delete.push(pk_value);
         }
     }
-    rtxn.commit().unwrap_or_report();
 
     info!("pg ambulkdelete: deleting {} documents", to_delete.len());
 
     // Delete such documents
-    let mut wtxn = milli_index.write_txn().unwrap_or_report();
     let milli_idx_config: milli::update::IndexerConfig = (&options).into();
     let milli_idx_doc_config: milli::update::IndexDocumentsConfig = (&options).into();
     let indexer = milli::update::IndexDocuments::new(
@@ -450,16 +454,16 @@ pub extern "C" fn ambulkdelete(
     indexer.execute().unwrap_or_report();
     wtxn.commit().unwrap_or_report();
 
-    ptr::null_mut()
+    stats.into_pg()
 }
 
 #[pg_guard]
 pub extern "C" fn amvacuumcleanup(
     _info: *mut pg_sys::IndexVacuumInfo,
-    _stats: *mut pg_sys::IndexBulkDeleteResult,
+    stats: *mut pg_sys::IndexBulkDeleteResult,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
     info!("pgmumbo amvacuumcleanup");
-    ptr::null_mut()
+    stats
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -537,43 +541,17 @@ struct Options {
 #[pg_guard]
 pub extern "C" fn amoptions(reloptions: pg_sys::Datum, validate: bool) -> *mut pg_sys::bytea {
     info!("pgmumbo amoptions... validate {validate}");
-    if reloptions.is_null() {
-        return ptr::null_mut();
-    }
-
-    let reloptions =
-        unsafe { pg_sys::pg_detoast_datum(reloptions.cast_mut_ptr()) } as *mut pg_sys::ArrayType;
 
     // pgmumbo encodes options using CBOR as opposed to StdRdOptions.
     // Consequently, build_reloptions isn't used.
-    const TEXT_ELMTYPE: Oid = pg_sys::TEXTOID;
-    const TEXT_ELMLEN: raw::c_int = -1;
-    const TEXT_ELMBYVAL: bool = false;
-    const TEXT_ELMALIGN: raw::c_char = pg_sys::TYPALIGN_INT as raw::c_char;
 
-    let mut elemsp: *mut pg_sys::Datum = ptr::null_mut();
-    let mut nullsp: *mut bool = ptr::null_mut();
-    let mut nelemsp: raw::c_int = 0;
-    unsafe {
-        pg_sys::deconstruct_array(
-            reloptions,
-            TEXT_ELMTYPE,
-            TEXT_ELMLEN,
-            TEXT_ELMBYVAL,
-            TEXT_ELMALIGN,
-            &mut elemsp,
-            &mut nullsp,
-            &mut nelemsp,
-        )
-    };
-    let elemsp = unsafe { PgBox::<pg_sys::Datum>::from_rust(elemsp) };
-    let nullsp = unsafe { PgBox::<bool>::from_rust(nullsp) };
+    let array: datum::Array<&str> = unsafe {
+        datum::Array::from_polymorphic_datum(reloptions, reloptions.is_null(), pg_sys::TEXTOID)
+    }
+    .unwrap();
+    let elems = array.iter().flatten();
 
-    let nelem = nelemsp as usize;
-    let elems = unsafe { slice::from_raw_parts(elemsp.as_ref(), nelem) };
-    let nulls = unsafe { slice::from_raw_parts(nullsp.as_ref(), nelem) };
-
-    let bytes = match encode_options(validate, elems, nulls) {
+    let bytes = match encode_options(validate, elems) {
         Ok(bytes) => bytes,
         Err(error) => {
             ereport!(
@@ -584,21 +562,7 @@ pub extern "C" fn amoptions(reloptions: pg_sys::Datum, validate: bool) -> *mut p
         }
     };
 
-    let encoded_size = mem::size_of::<[::std::os::raw::c_char; 4usize]>() + bytes.len();
-    let encoded = unsafe {
-        PgBox::<pg_sys::bytea>::from_rust(pg_sys::palloc0(encoded_size) as *mut pg_sys::bytea)
-    };
-
-    unsafe { set_varsize_4b(encoded.as_ptr(), encoded_size as i32) };
-    unsafe {
-        ptr::copy_nonoverlapping(
-            bytes.as_ptr(),
-            vardata_4b(encoded.as_ptr()) as *mut u8,
-            bytes.len(),
-        )
-    };
-
-    encoded.into_pg()
+    bytes.into_datum().unwrap().cast_mut_ptr()
 }
 
 static OPTIONS_FIELD_NAMES: LazyLock<HashSet<String>> = LazyLock::new(|| {
@@ -609,24 +573,15 @@ static OPTIONS_FIELD_NAMES: LazyLock<HashSet<String>> = LazyLock::new(|| {
     }
 });
 
-fn encode_options(
+fn encode_options<'a>(
     validate: bool,
-    elems: &[pg_sys::Datum],
-    nulls: &[bool],
+    elems: impl Iterator<Item = &'a str>,
 ) -> Result<Vec<u8>, Error> {
-    let pairs = zip(nulls, elems)
-        .filter_map(|(null, elem)| {
-            if *null {
-                return None;
-            }
-            let (k_str, v_str) =
-                unsafe { CStr::from_ptr(pg_sys::text_to_cstring(elem.cast_mut_ptr())) }
-                    .to_str()
-                    .unwrap_or_report()
-                    .split_once('=')
-                    .unwrap();
+    let pairs = elems
+        .map(|elem| {
+            let (k_str, v_str) = elem.split_once('=').unwrap();
             let k = k_str.to_string();
-            Some(serde_json::from_str::<serde_json::Value>(v_str).map(|v| (k, v)))
+            serde_json::from_str::<serde_json::Value>(v_str).map(|v| (k, v))
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(Error::OptionsParseValue)?;
@@ -706,7 +661,7 @@ pub extern "C" fn amvalidate(_opclassoid: Oid) -> bool {
     true
 }
 
-const SCAN_RESULT_SIZE: usize = 20;
+const DEFAULT_SCAN_BATCH_SIZE: usize = 64; // Picked arbitrarily for now
 
 #[self_referencing]
 struct ScanState {
@@ -717,13 +672,19 @@ struct ScanState {
     #[borrows(milli_index, lmdb_rtxn)]
     #[covariant]
     milli_context: milli::SearchContext<'this>,
+    // Keep a universe for usage in amgetbitmap
+    universe: RoaringBitmap,
     // Batch up paginated search results in a Vec
     search_page: Vec<milli::DocumentId>,
     // Use as a global id to support forward/backward scans across pages
     search_idx: usize,
     // Storage for ammarkpos and amrestrpos
+    marked_page: Vec<milli::DocumentId>,
     marked_idx: Option<usize>,
 }
+
+#[derive(Default, Serialize, Deserialize, PostgresType)]
+struct Query {}
 
 #[pg_guard]
 pub extern "C" fn ambeginscan(
@@ -755,8 +716,10 @@ pub extern "C" fn ambeginscan(
         milli_context_builder: |milli_index, lmdb_rtxn| {
             milli::SearchContext::new(milli_index, lmdb_rtxn).unwrap_or_report()
         },
+        universe: RoaringBitmap::new(),
         search_page: Vec::default(),
         search_idx: 0,
+        marked_page: Vec::default(),
         marked_idx: None,
     };
     // Load the state into the scan description
@@ -770,9 +733,9 @@ pub extern "C" fn ambeginscan(
 #[pg_guard]
 pub extern "C" fn amrescan(
     scan: pg_sys::IndexScanDesc,
-    keys: pg_sys::ScanKey,
+    _keys: pg_sys::ScanKey,
     _nkeys: ::std::os::raw::c_int,
-    orderbys: pg_sys::ScanKey,
+    _orderbys: pg_sys::ScanKey,
     _norderbys: ::std::os::raw::c_int,
 ) {
     info!("pgmumbo amrescan");
@@ -788,61 +751,89 @@ pub extern "C" fn amrescan(
     // if ambitmapscan, then we translate the universe into TIDBitmap
     // if amgettuple, then we increase or decrease the search_idx, and grab a new cached page if needed
 
-    let universe = state
+    let mut universe = state
         .borrow_milli_index()
         .documents_ids(state.borrow_lmdb_rtxn())
         .unwrap_or_report();
 
-    state.with_mut(|state| {
-        let documents = milli::execute_search(
-            state.milli_context,
-            None,
-            milli::TermsMatchingStrategy::Last,
-            milli::score_details::ScoringStrategy::Skip,
-            false,
-            universe,
-            &None,
-            &None,
-            milli::GeoSortStrategy::default(),
-            0,
-            20,
-            None,
-            &mut milli::DefaultSearchLogger,
-            &mut milli::DefaultSearchLogger,
-            milli::TimeBudget::max(),
-            None,
-        )
-        .unwrap_or_report();
-        *state.search_page = documents.documents_ids;
+    state.with_mut(|mut state| {
+        state.universe = &mut universe;
     });
 }
 
-// #[pg_guard]
-// pub extern "C" fn amgettuple(
-//     scan: pg_sys::IndexScanDesc,
-//     _direction: pg_sys::ScanDirection,
-// ) -> bool {
-//     todo!()
-// }
+#[pg_guard]
+pub extern "C" fn amgettuple(
+    scan: pg_sys::IndexScanDesc,
+    direction: pg_sys::ScanDirection::Type,
+) -> bool {
+    info!("pgmumbo amgettuple");
+    let scan = unsafe { PgBox::from_pg(scan) };
+    let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
 
-// #[pg_guard]
-// pub extern "C" fn ambitmapscan(scan: pg_sys::IndexScanDesc, tbm: *mut pg_sys::TIDBitmap) -> i64 {
-//     todo!()
-// }
+    match direction {
+        pg_sys::ScanDirection::ForwardScanDirection => {}
+        pg_sys::ScanDirection::BackwardScanDirection => {}
+        pg_sys::ScanDirection::NoMovementScanDirection => {}
+        _ => ereport!(
+            ERROR,
+            PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+            format!("Unsupported scan direction: {direction}")
+        ),
+    };
+
+    false
+}
+
+#[pg_guard]
+pub extern "C" fn ambitmapscan(scan: pg_sys::IndexScanDesc, tbm: *mut pg_sys::TIDBitmap) -> i64 {
+    info!("pgmumbo ambitmapscan");
+    let scan = unsafe { PgBox::from_pg(scan) };
+    let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
+
+    // Convert the universe into a Vec of TIDs
+    let mut tids = Vec::new();
+    state.with_mut(|state| {
+        let universe = state.universe.clone();
+        let rtxn = state.lmdb_rtxn;
+        let milli_index = state.milli_index;
+        let milli_index_fields = milli_index.fields_ids_map(rtxn).unwrap_or_report();
+        let milli_primary_key =
+            milli::documents::PrimaryKey::new(TID_PRIMARY_KEY, &milli_index_fields).unwrap();
+        for (_, kv_reader) in milli_index
+            .documents(rtxn, universe.into_iter())
+            .unwrap_or_report()
+        {
+            let pk_value = milli_primary_key
+                .document_id(&kv_reader, &milli_index_fields)
+                .unwrap_or_report()
+                .map_err(|_| todo!())
+                .unwrap();
+            let tid = name_to_tid(&pk_value).unwrap_or_report();
+            tids.push(tid);
+        }
+    });
+
+    // Add the TID Vec to a TIDBitmap
+    unsafe {
+        pg_sys::tbm_add_tuples(tbm, *tids.as_ptr(), tids.len() as i32, false);
+    }
+
+    tids.len() as i64
+}
 
 #[pg_guard]
 pub extern "C" fn amendscan(scan: pg_sys::IndexScanDesc) {
     info!("pgmumbo amendscan");
     let scan = unsafe { PgBox::from_pg(scan) };
-    {
-        let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
-        // Close out read transaction
-        state.with_mut(|state| {
-            unsafe { ptr::read(state.lmdb_rtxn) }
-                .commit()
-                .unwrap_or_report();
-        });
-    }
+
+    // Release state resources
+    let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
+    state.with_mut(|state| {
+        unsafe { ptr::read(state.lmdb_rtxn) }
+            .commit()
+            .unwrap_or_report();
+    });
+    drop(state);
     unsafe { pg_sys::pfree(scan.opaque) };
 }
 
