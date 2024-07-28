@@ -12,6 +12,7 @@
   - [x] aminsert
   - [x] ambulkdelete
   - [x] amvacuumcleanup
+  - [ ] amcanreturn
   - [x] amoptions
   - [x] amvalidate
   - [x] ambeginscan

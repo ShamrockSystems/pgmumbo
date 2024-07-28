@@ -14,8 +14,10 @@ use milli::{
     documents::{documents_batch_reader_from_objects, DocumentsBatchBuilder, DocumentsBatchReader},
     heed,
 };
-use pg_sys::{panic::ErrorReportable, Oid};
-use pgrx::{datum, prelude::*, vardata_4b, varsize_4b, PgMemoryContexts, PgRelation};
+use pg_sys::{object_access_hook_type, panic::ErrorReportable, Oid};
+use pgrx::{
+    datum, prelude::*, register_hook, vardata_4b, varsize_4b, PgMemoryContexts, PgRelation,
+};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,13 +29,20 @@ extern crate ouroboros;
 
 pgrx::pg_module_magic!();
 
-extension_sql_file!("lib.sql");
-
 #[allow(non_snake_case)]
 #[pg_guard]
 pub extern "C" fn _PG_init() {
     info!("{PROGRAM_NAME} loaded");
 }
+
+extension_sql!(
+    // Language=SQL
+    "CREATE ACCESS METHOD pgmumbo 
+        TYPE INDEX
+        HANDLER pgmumbo_amhandler;",
+    name = "index_access_method",
+    requires = [amhandler],
+);
 
 // Not sure if pgrx allows for custom return types without overriding SQL.
 // Postgres expects the amhandler to return index_am_handler
@@ -48,11 +57,22 @@ fn amhandler(
     let mut amroutine =
         unsafe { PgBox::<pg_sys::IndexAmRoutine>::alloc_node(pg_sys::NodeTag::T_IndexAmRoutine) };
 
-    amroutine.amstrategies = 4;
+    amroutine.amstrategies = 1; // Enumerated in operator classes
     amroutine.amsupport = 0;
+    amroutine.amoptsprocnum = 0;
+    amroutine.amcanorder = false;
+    amroutine.amcanorderbyop = true; // Check if this applies to ranking
+    amroutine.amcanbackward = true;
+    amroutine.amcanunique = true;
     amroutine.amcanmulticol = true;
     amroutine.amsearcharray = true;
-
+    amroutine.amstorage = true;
+    amroutine.amclusterable = false;
+    amroutine.ampredlocks = false;
+    amroutine.amcanparallel = false;
+    amroutine.amcaninclude = true;
+    amroutine.amusemaintenanceworkmem = false;
+    amroutine.amparallelvacuumoptions = pg_sys::VACUUM_OPTION_NO_PARALLEL as u8;
     amroutine.amkeytype = Oid::INVALID;
 
     amroutine.ambuild = Some(ambuild);
@@ -60,14 +80,24 @@ fn amhandler(
     amroutine.aminsert = Some(aminsert);
     amroutine.ambulkdelete = Some(ambulkdelete);
     amroutine.amvacuumcleanup = Some(amvacuumcleanup);
+    amroutine.amcanreturn = None;
     amroutine.amcostestimate = Some(amcostestimate);
     amroutine.amoptions = Some(amoptions);
+    amroutine.amproperty = None;
+    amroutine.ambuildphasename = None;
     amroutine.amvalidate = Some(amvalidate);
+    amroutine.amadjustmembers = None;
     amroutine.ambeginscan = Some(ambeginscan);
     amroutine.amrescan = Some(amrescan);
-    // amroutine.amgettuple = Some(amgettuple);
-    // amroutine.amgetbitmap = Some(ambitmapscan);
+    amroutine.amgettuple = Some(amgettuple);
+    amroutine.amgetbitmap = Some(amgetbitmap);
     amroutine.amendscan = Some(amendscan);
+    amroutine.ammarkpos = None;
+    amroutine.amrestrpos = None;
+
+    amroutine.amestimateparallelscan = None;
+    amroutine.aminitparallelscan = None;
+    amroutine.amparallelrescan = None;
 
     amroutine.into_pg_boxed()
 }
@@ -79,7 +109,7 @@ const INITIAL_LMDB_MMAP_SIZE: usize = 64 * 1024 * 1024 * 1024; // Initialize LMD
 const TID_PRIMARY_KEY: &str = "@pgmumbo_tid";
 
 // Called on CREATE INDEX.
-// I'm pretty sure REINDEX just creates a new index relations with a different Oid,
+// I'm pretty sure REINDEX just creates a new index relation with a different Oid,
 // so Postgres should handle that for us. When the original index is DROP'ed though can we hook into that?
 #[pg_guard]
 pub extern "C" fn ambuild(
@@ -661,6 +691,14 @@ pub extern "C" fn amvalidate(_opclassoid: Oid) -> bool {
     true
 }
 
+extension_sql!(
+    "CREATE OPERATOR CLASS pgmumbo_ops_anyelement
+        USING pgmumbo AS
+        OPERATOR 1 pg_catalog.@@ (tid, pgmumboquery);",
+    name = "operator_class_pgmumboquery",
+    requires = ["index_access_method"],
+);
+
 const DEFAULT_SCAN_BATCH_SIZE: usize = 64; // Picked arbitrarily for now
 
 #[self_referencing]
@@ -733,14 +771,19 @@ pub extern "C" fn ambeginscan(
 #[pg_guard]
 pub extern "C" fn amrescan(
     scan: pg_sys::IndexScanDesc,
-    _keys: pg_sys::ScanKey,
-    _nkeys: ::std::os::raw::c_int,
-    _orderbys: pg_sys::ScanKey,
-    _norderbys: ::std::os::raw::c_int,
+    keys: pg_sys::ScanKey,
+    nkeys: ::std::os::raw::c_int,
+    orderbys: pg_sys::ScanKey,
+    norderbys: ::std::os::raw::c_int,
 ) {
     info!("pgmumbo amrescan");
     let scan = unsafe { PgBox::from_pg(scan) };
     let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
+
+    if !keys.is_null() && !orderbys.is_null() {
+        let keys = unsafe { slice::from_raw_parts(keys, nkeys as usize) };
+        let orderbys = unsafe { slice::from_raw_parts(orderbys, norderbys as usize) };
+    }
 
     // Need to restart scan with new values, TODO limit universe and apply settings
     // if !keys.is_null() && !orderbys.is_null() {}
@@ -785,7 +828,7 @@ pub extern "C" fn amgettuple(
 }
 
 #[pg_guard]
-pub extern "C" fn ambitmapscan(scan: pg_sys::IndexScanDesc, tbm: *mut pg_sys::TIDBitmap) -> i64 {
+pub extern "C" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *mut pg_sys::TIDBitmap) -> i64 {
     info!("pgmumbo ambitmapscan");
     let scan = unsafe { PgBox::from_pg(scan) };
     let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
