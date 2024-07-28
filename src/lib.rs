@@ -525,21 +525,7 @@ enum MilliCompressionTypeDef {
 #[serde_nested]
 #[derive(Default, Serialize, Deserialize)]
 struct Options {
-    // Unmanaged MilliIndexerConfig fields
-    mc_log_every_n: Option<usize>,
-    mc_max_nb_chunks: Option<usize>,
-    mc_documents_chunk_size: Option<usize>,
-    mc_max_memory: Option<usize>,
-    #[serde(default)]
-    #[serde_nested(
-        sub = "milli::CompressionType",
-        serde(with = "MilliCompressionTypeDef")
-    )]
-    mc_chunk_compression_type: Option<milli::CompressionType>,
-    mc_chunk_compression_level: Option<u32>,
-    mc_max_positions_per_attributes: Option<u32>,
-    mc_skip_index_budget: Option<bool>,
-    // Unmanaged MilliSettings fields
+    // Unmanaged milli::update::Settings fields
     ms_searchable_fields: Option<Vec<String>>,
     ms_displayed_fields: Option<Vec<String>>,
     ms_filterable_fields: Option<HashSet<String>>,
@@ -561,11 +547,25 @@ struct Options {
     ms_pagination_max_total_hits: Option<usize>,
     ms_proximity_precision: Option<milli::proximity::ProximityPrecision>,
     ms_search_cutoff: Option<u64>,
-    // Unmanaged MilliIndexDocumentsConfig fields
-    mid_doc_words_prefix_threshold: Option<u32>,
-    mid_doc_max_prefix_length: Option<usize>,
-    mid_doc_words_positions_level_group_size: Option<NonZeroU32>,
-    mid_doc_words_positions_min_level_size: Option<NonZeroU32>,
+    // Unmanaged milli::update::IndexerConfig fields
+    mic_log_every_n: Option<usize>,
+    mic_max_nb_chunks: Option<usize>,
+    mic_documents_chunk_size: Option<usize>,
+    mic_max_memory: Option<usize>,
+    #[serde(default)]
+    #[serde_nested(
+        sub = "milli::CompressionType",
+        serde(with = "MilliCompressionTypeDef")
+    )]
+    mic_chunk_compression_type: Option<milli::CompressionType>,
+    mic_chunk_compression_level: Option<u32>,
+    mic_max_positions_per_attributes: Option<u32>,
+    mic_skip_index_budget: Option<bool>,
+    // Unmanaged milli::update::IndexDocumentsConfig fields
+    midc_doc_words_prefix_threshold: Option<u32>,
+    midc_doc_max_prefix_length: Option<usize>,
+    midc_doc_words_positions_level_group_size: Option<NonZeroU32>,
+    midc_doc_words_positions_min_level_size: Option<NonZeroU32>,
 }
 
 #[pg_guard]
@@ -659,15 +659,15 @@ impl TryFrom<*mut pg_sys::varlena> for Options {
 impl From<&Options> for milli::update::IndexerConfig {
     fn from(val: &Options) -> Self {
         milli::update::IndexerConfig {
-            log_every_n: val.mc_log_every_n,
-            max_nb_chunks: val.mc_max_nb_chunks,
-            documents_chunk_size: val.mc_documents_chunk_size,
-            max_memory: val.mc_max_memory,
-            chunk_compression_type: val.mc_chunk_compression_type.unwrap_or_default(),
-            chunk_compression_level: val.mc_chunk_compression_level,
+            log_every_n: val.mic_log_every_n,
+            max_nb_chunks: val.mic_max_nb_chunks,
+            documents_chunk_size: val.mic_documents_chunk_size,
+            max_memory: val.mic_max_memory,
+            chunk_compression_type: val.mic_chunk_compression_type.unwrap_or_default(),
+            chunk_compression_level: val.mic_chunk_compression_level,
             thread_pool: None,
-            max_positions_per_attributes: val.mc_max_positions_per_attributes,
-            skip_index_budget: val.mc_skip_index_budget.unwrap_or(false),
+            max_positions_per_attributes: val.mic_max_positions_per_attributes,
+            skip_index_budget: val.mic_skip_index_budget.unwrap_or(false),
         }
     }
 }
@@ -675,10 +675,10 @@ impl From<&Options> for milli::update::IndexerConfig {
 impl From<&Options> for milli::update::IndexDocumentsConfig {
     fn from(val: &Options) -> Self {
         milli::update::IndexDocumentsConfig {
-            words_prefix_threshold: val.mid_doc_words_prefix_threshold,
-            max_prefix_length: val.mid_doc_max_prefix_length,
-            words_positions_level_group_size: val.mid_doc_words_positions_level_group_size,
-            words_positions_min_level_size: val.mid_doc_words_positions_min_level_size,
+            words_prefix_threshold: val.midc_doc_words_prefix_threshold,
+            max_prefix_length: val.midc_doc_max_prefix_length,
+            words_positions_level_group_size: val.midc_doc_words_positions_level_group_size,
+            words_positions_min_level_size: val.midc_doc_words_positions_min_level_size,
             update_method: milli::update::IndexDocumentsMethod::ReplaceDocuments,
             autogenerate_docids: false,
         }
