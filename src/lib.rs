@@ -155,16 +155,16 @@ fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine>
     amroutine.amsupport = 0;
     amroutine.amoptsprocnum = 0;
     amroutine.amcanorder = false;
-    amroutine.amcanorderbyop = true; // Check if this applies to ranking
-    amroutine.amcanbackward = true;
-    amroutine.amcanunique = true;
-    amroutine.amcanmulticol = false;
+    amroutine.amcanorderbyop = false; // Check if this applies to ranking
+    amroutine.amcanbackward = false;
+    amroutine.amcanunique = false;
+    amroutine.amcanmulticol = true;
     amroutine.amsearcharray = true;
-    amroutine.amstorage = true;
+    amroutine.amstorage = false;
     amroutine.amclusterable = false;
     amroutine.ampredlocks = false;
     amroutine.amcanparallel = false;
-    amroutine.amcaninclude = true;
+    amroutine.amcaninclude = false;
     amroutine.amusemaintenanceworkmem = false;
     amroutine.amparallelvacuumoptions = pg_sys::VACUUM_OPTION_NO_PARALLEL as u8;
     amroutine.amkeytype = pg_sys::Oid::INVALID;
@@ -183,7 +183,7 @@ fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine>
     amroutine.amadjustmembers = None;
     amroutine.ambeginscan = Some(ambeginscan);
     amroutine.amrescan = Some(amrescan);
-    amroutine.amgettuple = Some(amgettuple);
+    amroutine.amgettuple = None; //Some(amgettuple);
     amroutine.amgetbitmap = Some(amgetbitmap);
     amroutine.amendscan = Some(amendscan);
     amroutine.ammarkpos = None;
@@ -379,8 +379,7 @@ fn form_document(
     values: &[pg_sys::Datum],
     attrs: &[pg_sys::FormData_pg_attribute],
 ) -> serde_json::Map<String, serde_json::Value> {
-    let mut it = zip(isnull, zip(attrs, values));
-    it.next().unwrap(); // Consume non-INCLUDE clause column
+    let it = zip(isnull, zip(attrs, values));
     serde_json::Map::from_iter(
         // Managed primary key; 1:1 mapping with TID
         iter::once((
@@ -785,22 +784,22 @@ pub extern "C" fn amvalidate(_opclassoid: pg_sys::Oid) -> bool {
 }
 
 #[pg_extern]
-fn pgmumboquery_cmpfunc(
+fn pgmumboquery_op(
     _fcinfo: pg_sys::FunctionCallInfo,
-    _anyelem: PgBox<pgrx::AnyElement>,
-    _query: PgmumboQuery,
-) -> bool {
-    true
+    _anyelement: PgBox<pgrx::AnyElement>,
+    query: PgBox<PgmumboQuery>,
+) -> PgBox<PgmumboQuery> {
+    query
 }
 
 extension_sql!(
     "CREATE OPERATOR pg_catalog.@? (
-        FUNCTION = pgmumboquery_cmpfunc,
+        FUNCTION = pgmumboquery_op,
         LEFTARG  = anyelement,
         RIGHTARG = pgmumboquery
     );",
     name = "operator_pgmumboquery",
-    requires = [pgmumboquery_cmpfunc, PgmumboQuery],
+    requires = [pgmumboquery_op, PgmumboQuery],
 );
 
 extension_sql!(
@@ -916,8 +915,10 @@ pub extern "C" fn amrescan(
     let mut opaque = unsafe { PgBox::from_pg(scan.opaque as *mut ScanOpaque) };
 
     if !keys.is_null() && !orderbys.is_null() {
-        let _keys = unsafe { slice::from_raw_parts(keys, nkeys as usize) };
-        let _orderbys = unsafe { slice::from_raw_parts(orderbys, norderbys as usize) };
+        let keys = unsafe { slice::from_raw_parts(keys, nkeys as usize) };
+        let orderbys = unsafe { slice::from_raw_parts(orderbys, norderbys as usize) };
+
+        info!("{keys:?}\n{orderbys:?}");
     }
 
     // Need to restart scan with new values, TODO limit universe and apply settings
