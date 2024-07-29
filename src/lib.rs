@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::{
     borrow::BorrowMut,
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -16,16 +18,8 @@ use milli::{
     documents::{documents_batch_reader_from_objects, DocumentsBatchBuilder, DocumentsBatchReader},
     heed,
 };
-use pg_sys::{
-    object_access_hook_type, panic::ErrorReportable, ObjectAccessDrop,
-    RawParseMode::RAW_PARSE_TYPE_NAME,
-};
-use pgrx::{
-    datum,
-    memcx::{self, MemCx},
-    prelude::*,
-    vardata_4b, varsize_4b, PgMemoryContexts, PgRelation,
-};
+use pg_sys::{object_access_hook_type, panic::ErrorReportable, ObjectAccessDrop};
+use pgrx::{datum, memcx, prelude::*, vardata_4b, varsize_4b, PgMemoryContexts, PgRelation};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -460,7 +454,6 @@ pub extern "C" fn ambuildempty(_index_relation: pg_sys::Relation) {
     info!("{PROGRAM_NAME} ambuildempty");
 }
 
-#[allow(clippy::too_many_arguments)]
 #[pg_guard]
 pub extern "C" fn aminsert(
     index_relation: pg_sys::Relation,
@@ -792,7 +785,11 @@ pub extern "C" fn amvalidate(_opclassoid: pg_sys::Oid) -> bool {
 }
 
 #[pg_extern]
-fn pgmumboquery_cmpfunc(anyelem: PgBox<pgrx::AnyElement>, query: PgmumboQuery) -> bool {
+fn pgmumboquery_cmpfunc(
+    _fcinfo: pg_sys::FunctionCallInfo,
+    _anyelem: PgBox<pgrx::AnyElement>,
+    _query: PgmumboQuery,
+) -> bool {
     true
 }
 
@@ -815,7 +812,7 @@ extension_sql!(
     requires = ["index_access_method", "operator_pgmumboquery", PgmumboQuery],
 );
 
-const DEFAULT_SCAN_BATCH_SIZE: usize = 64; // Picked arbitrarily for now
+const _DEFAULT_SCAN_BATCH_SIZE: usize = 64; // Picked arbitrarily for now
 
 #[self_referencing]
 struct ScanState {
@@ -836,9 +833,6 @@ struct ScanState {
     marked_page: Vec<milli::DocumentId>,
     marked_idx: Option<usize>,
 }
-
-#[derive(Default, Serialize, Deserialize, PostgresType)]
-struct PgmumboQuery {}
 
 #[pg_guard]
 pub extern "C" fn ambeginscan(
@@ -884,6 +878,31 @@ pub extern "C" fn ambeginscan(
     scan.into_pg()
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "milli::TermsMatchingStrategy")]
+enum MilliTermsMatchingStrategyDef {
+    Last,
+    All,
+    Frequency,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "milli::score_details::ScoringStrategy")]
+enum MilliScoringStrategyDef {
+    Skip,
+    Detailed,
+}
+
+#[derive(Default, Serialize, Deserialize, PostgresType)]
+struct PgmumboQuery {
+    query: Option<String>,
+    filter: Option<String>,
+    #[serde(default, with = "MilliTermsMatchingStrategyDef")]
+    terms_matching_strategy: milli::TermsMatchingStrategy,
+    #[serde(default, with = "MilliScoringStrategyDef")]
+    scoring_strategy: milli::score_details::ScoringStrategy,
+}
+
 #[pg_guard]
 pub extern "C" fn amrescan(
     scan: pg_sys::IndexScanDesc,
@@ -897,8 +916,8 @@ pub extern "C" fn amrescan(
     let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
 
     if !keys.is_null() && !orderbys.is_null() {
-        let keys = unsafe { slice::from_raw_parts(keys, nkeys as usize) };
-        let orderbys = unsafe { slice::from_raw_parts(orderbys, norderbys as usize) };
+        let _keys = unsafe { slice::from_raw_parts(keys, nkeys as usize) };
+        let _orderbys = unsafe { slice::from_raw_parts(orderbys, norderbys as usize) };
     }
 
     // Need to restart scan with new values, TODO limit universe and apply settings
@@ -927,7 +946,7 @@ pub extern "C" fn amgettuple(
 ) -> bool {
     info!("{PROGRAM_NAME} amgettuple");
     let scan = unsafe { PgBox::from_pg(scan) };
-    let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
+    let _state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
 
     match direction {
         pg_sys::ScanDirection::ForwardScanDirection => {}
