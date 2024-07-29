@@ -12,20 +12,20 @@
   - [x] aminsert
   - [x] ambulkdelete
   - [x] amvacuumcleanup
-  - [ ] amcanreturn
+  - [x] amcanreturn
   - [x] amoptions
   - [x] amvalidate
   - [x] ambeginscan
-  - [ ] tear apart milli's `execute_search` into three pieces
-    - [ ] setup
-    - [ ] compute roaring bitmap
+  - [x] tear apart milli's `execute_search` into three pieces
+    - [x] setup
+    - [x] compute roaring bitmap
     - [ ] perform start-end paginated bucket sort
-  - [ ] ambrescan (setup and compute bitmap)
-  - [ ] amgetbitmap
-    - [ ] figure out how to convert roaringbitmap into a TIDBitmap (roaring document IDs do not map easily to TIDs... do we really need to grab each document à la `milli::PrimaryKey`??)
+  - [x] ambrescan (setup and compute bitmap)
+  - [x] amgetbitmap
+    - [x] figure out how to convert roaringbitmap into a TIDBitmap ~~(roaring document IDs do not map easily to TIDs... do we really need to grab each document à la `milli::PrimaryKey`??)~~ Answer: yes, for now
   - [ ] amgettuple
-  - [ ] ammarkpos
-  - [ ] amrestrpos
+  - [x] ammarkpos
+  - [x] amrestrpos
   - [x] amendscan
 - [ ] operator class
   - [ ] `anyelement ?= ("query")`
@@ -34,6 +34,17 @@
 - [ ] LMDB automatic memory map extension (free ratio check during VACUUM & LMDB RW XACT MMap Full failure)... inspect DB w/ `heed` before reopening?
 - [ ] review MVCC semantics
 - [ ] review meili reindexing semantics
+
+```sql
+CREATE INDEX ON foo USING pgmumbo ((foo)) INCLUDE (a, b, c) WITH (
+  ms_searchable_fields='["b", "c"]',
+  ms_stop_words='["whack"]',
+);
+
+SELECT * FROM foo WHERE foo @? pgmumbo_query("search term");
+SELECT * FROM foo WHERE foo @? pgmumbo_filter("milli filter expression");
+SELECT * FROM foo WHERE foo @? pgmumbo_query("search term", "milli filter expression");
+```
 
 This thing stores data in the `${PGDATA}/ext_pgmumbo/` (or `${TABLESPACE}/ext_pgmumbo/`) directory; that's where it opens the LMDB directories (in subdirs per database OID and index OID). I really can't figure out right now if there's a better way to store this stuff. LMDB just stores data on disk and I'm pretty sure we can't run milli on just postgres relations effectively.
 

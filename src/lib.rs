@@ -1,10 +1,12 @@
 use std::{
+    borrow::BorrowMut,
     collections::{BTreeMap, BTreeSet, HashSet},
     ffi::{self, CStr},
     fs,
     io::{self, Cursor},
     iter::{self, zip},
     num::{NonZeroU32, ParseIntError},
+    os::raw,
     path::{Path, PathBuf},
     ptr, slice,
     sync::LazyLock,
@@ -14,9 +16,15 @@ use milli::{
     documents::{documents_batch_reader_from_objects, DocumentsBatchBuilder, DocumentsBatchReader},
     heed,
 };
-use pg_sys::{object_access_hook_type, panic::ErrorReportable, Oid};
+use pg_sys::{
+    object_access_hook_type, panic::ErrorReportable, ObjectAccessDrop,
+    RawParseMode::RAW_PARSE_TYPE_NAME,
+};
 use pgrx::{
-    datum, prelude::*, register_hook, vardata_4b, varsize_4b, PgMemoryContexts, PgRelation,
+    datum,
+    memcx::{self, MemCx},
+    prelude::*,
+    vardata_4b, varsize_4b, PgMemoryContexts, PgRelation,
 };
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -29,10 +37,104 @@ extern crate ouroboros;
 
 pgrx::pg_module_magic!();
 
+thread_local! {
+    static EXISTING_OBJECT_ACCESS_HOOK: object_access_hook_type = None;
+}
+
 #[allow(non_snake_case)]
 #[pg_guard]
 pub extern "C" fn _PG_init() {
     info!("{PROGRAM_NAME} loaded");
+    #[pg_guard]
+    extern "C" fn pgmumbo_oat_hook(
+        access: pg_sys::ObjectAccessType::Type,
+        class_id: pg_sys::Oid,
+        object_id: pg_sys::Oid,
+        sub_id: ffi::c_int,
+        arg: *mut ffi::c_void,
+    ) {
+        EXISTING_OBJECT_ACCESS_HOOK.with(|existing_hook| {
+            if let Some(existing_hook) = existing_hook {
+                unsafe { existing_hook(access, class_id, object_id, sub_id, arg) };
+            }
+        });
+
+        if access == pg_sys::ObjectAccessType::OAT_DROP
+            && (class_id == pg_sys::RelationRelationId || class_id == pg_sys::IndexRelationId)
+            && sub_id == 0
+        {
+            let mut oat_hook_context = PgMemoryContexts::new(PROGRAM_NAME);
+            let mut old_owned_context = unsafe { oat_hook_context.set_as_current() };
+
+            let dropflags = unsafe { *(arg as *mut ObjectAccessDrop) }.dropflags as u32;
+
+            let index_relation = unsafe { PgRelation::open(object_id) };
+            if !index_relation.is_index() {
+                return;
+            }
+
+            // Check if pgmumbo is the one servicing this index
+            let mut managed = false;
+            memcx::current_context(|memcx| {
+                let amhandler_name = unsafe {
+                    PgBox::<ffi::c_char>::from_rust(pg_sys::pstrdup(c"pgmumbo_amhandler".as_ptr()))
+                };
+                let mut amhandler_name_parts = ptr::null_mut();
+                unsafe {
+                    pg_sys::SplitIdentifierString(
+                        amhandler_name.as_ptr(),
+                        '.' as raw::c_char,
+                        &mut amhandler_name_parts,
+                    )
+                };
+                let amhandler_name_parts: pgrx::list::List<*mut ffi::c_void> =
+                    unsafe { pgrx::list::List::downcast_ptr_in_memcx(amhandler_name_parts, memcx) }
+                        .unwrap();
+
+                let mut amhandler_name_list = pgrx::list::List::<*mut ffi::c_void>::default();
+
+                amhandler_name_parts
+                    .iter()
+                    .map(|part| unsafe { pg_sys::makeString(pg_sys::pstrdup(part.cast())) })
+                    .for_each(|part| {
+                        amhandler_name_list.unstable_push_in_context(part.cast(), memcx);
+                    });
+
+                let argtypes = [pg_sys::INTERNALOID];
+                let amhandler = unsafe {
+                    pg_sys::LookupFuncName(
+                        amhandler_name_list.as_mut_ptr(),
+                        argtypes.len() as raw::c_int,
+                        argtypes.as_ptr(),
+                        false,
+                    )
+                };
+
+                managed = amhandler == index_relation.rd_amhandler;
+            });
+            if !managed {
+                return;
+            }
+
+            let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
+
+            if (dropflags & pg_sys::PERFORM_DELETION_QUIETLY) == 0 {
+                info!("{PROGRAM_NAME}: Removing index files in {index_path:?}");
+            }
+
+            fs::remove_dir_all(&index_path).unwrap_or_report();
+
+            unsafe {
+                old_owned_context.set_as_current();
+                oat_hook_context.reset();
+            }
+        }
+    }
+    EXISTING_OBJECT_ACCESS_HOOK.with(|mut existing_hook| {
+        *existing_hook.borrow_mut() =
+            unsafe { ptr::addr_of!(pg_sys::object_access_hook).as_ref().unwrap() };
+    });
+    unsafe { pg_sys::object_access_hook = Some(pgmumbo_oat_hook) };
 }
 
 extension_sql!(
@@ -51,9 +153,7 @@ extension_sql!(
         STRICT
         LANGUAGE c
         AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';")]
-fn amhandler(
-    _fcinfo: pg_sys::FunctionCallInfo,
-) -> PgBox<name!(index_am_handler, pg_sys::IndexAmRoutine)> {
+fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine> {
     let mut amroutine =
         unsafe { PgBox::<pg_sys::IndexAmRoutine>::alloc_node(pg_sys::NodeTag::T_IndexAmRoutine) };
 
@@ -64,7 +164,7 @@ fn amhandler(
     amroutine.amcanorderbyop = true; // Check if this applies to ranking
     amroutine.amcanbackward = true;
     amroutine.amcanunique = true;
-    amroutine.amcanmulticol = true;
+    amroutine.amcanmulticol = false;
     amroutine.amsearcharray = true;
     amroutine.amstorage = true;
     amroutine.amclusterable = false;
@@ -73,7 +173,7 @@ fn amhandler(
     amroutine.amcaninclude = true;
     amroutine.amusemaintenanceworkmem = false;
     amroutine.amparallelvacuumoptions = pg_sys::VACUUM_OPTION_NO_PARALLEL as u8;
-    amroutine.amkeytype = Oid::INVALID;
+    amroutine.amkeytype = pg_sys::Oid::INVALID;
 
     amroutine.ambuild = Some(ambuild);
     amroutine.ambuildempty = Some(ambuildempty);
@@ -117,7 +217,7 @@ pub extern "C" fn ambuild(
     index_relation: pg_sys::Relation,
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
-    info!("pgmumbo ambuild");
+    info!("{PROGRAM_NAME} ambuild");
 
     let heap_relation = unsafe { PgRelation::from_pg(heap_relation) };
     let index_relation = unsafe { PgRelation::from_pg(index_relation) };
@@ -233,8 +333,10 @@ extern "C" fn build_callback(
     let build_state = unsafe { (state as *mut BuildState).as_mut() }.unwrap();
     let mut old_owned_context = unsafe { build_state.owned_context.set_as_current() };
 
-    let desc = unsafe { PgRelation::from_pg(index).rd_att.as_ref() }.unwrap();
-    let natts = desc.natts as usize;
+    let index_relation = unsafe { PgRelation::from_pg(index) };
+
+    let desc = index_relation.tuple_desc();
+    let natts = desc.len();
 
     let isnull = unsafe { slice::from_raw_parts(isnull, natts) };
     let values = unsafe { slice::from_raw_parts(values, natts) };
@@ -242,7 +344,7 @@ extern "C" fn build_callback(
 
     let document = form_document(tid, isnull, values, attrs);
 
-    info!("pgmumbo heapscan: {document:?}");
+    info!("{PROGRAM_NAME} heapscan: {document:?}");
 
     build_state
         .batch_builder
@@ -283,45 +385,43 @@ fn form_document(
     values: &[pg_sys::Datum],
     attrs: &[pg_sys::FormData_pg_attribute],
 ) -> serde_json::Map<String, serde_json::Value> {
+    let mut it = zip(isnull, zip(attrs, values));
+    it.next().unwrap(); // Consume non-INCLUDE clause column
     serde_json::Map::from_iter(
         // Managed primary key; 1:1 mapping with TID
         iter::once((
             TID_PRIMARY_KEY.to_string(),
             serde_json::Value::String(tid_to_name(tid)),
         ))
-        // Then, convert tuple attrs and values to KV pairs
-        .chain(
-            zip(isnull, zip(attrs, values)).filter_map(|(isnull, (attr, value))| {
-                if *isnull {
-                    return None;
-                }
-                let detoasted = unsafe { pg_sys::pg_detoast_datum(value.cast_mut_ptr()) };
-                let document_key = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
+        // Then, convert INCLUDE clause tuple attrs and values to KV pairs
+        .chain(it.filter_map(|(isnull, (attr, value))| {
+            if *isnull {
+                return None;
+            }
+            let detoasted = unsafe { pg_sys::pg_detoast_datum(value.cast_mut_ptr()) };
+            let document_key = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
+                .to_str()
+                .unwrap_or_report()
+                .to_string();
+            let document_value = match attr.atttypid {
+                pg_sys::TEXTOID => serde_json::Value::String(
+                    unsafe {
+                        CStr::from_ptr(pg_sys::text_to_cstring(detoasted.cast::<pg_sys::text>()))
+                    }
                     .to_str()
                     .unwrap_or_report()
-                    .to_string();
-                let document_value = match attr.atttypid {
-                    pg_sys::TEXTOID => serde_json::Value::String(
-                        unsafe {
-                            CStr::from_ptr(pg_sys::text_to_cstring(
-                                detoasted.cast::<pg_sys::text>(),
-                            ))
-                        }
-                        .to_str()
-                        .unwrap_or_report()
-                        .to_string(),
-                    ),
-                    _ => serde_json::Value::Null,
-                };
-                Some((document_key, document_value))
-            }),
-        ),
+                    .to_string(),
+                ),
+                _ => serde_json::Value::Null,
+            };
+            Some((document_key, document_value))
+        })),
     )
 }
 
 const PGDATA_TBLSPC: &str = "pg_tblspc";
 
-fn spc_location(spc: Oid) -> Result<PathBuf, Error> {
+fn spc_location(spc: pg_sys::Oid) -> Result<PathBuf, Error> {
     let my_database_spc = unsafe { pg_sys::MyDatabaseTableSpace };
     let mut spc = spc;
 
@@ -331,7 +431,7 @@ fn spc_location(spc: Oid) -> Result<PathBuf, Error> {
             .unwrap_or_report(),
     );
 
-    if spc == Oid::INVALID {
+    if spc == pg_sys::Oid::INVALID {
         spc = my_database_spc;
     }
 
@@ -357,7 +457,7 @@ fn lmdb_location(node: pg_sys::RelFileNode) -> Result<PathBuf, Error> {
 
 #[pg_guard]
 pub extern "C" fn ambuildempty(_index_relation: pg_sys::Relation) {
-    info!("pgmumbo ambuildempty");
+    info!("{PROGRAM_NAME} ambuildempty");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -372,11 +472,11 @@ pub extern "C" fn aminsert(
     _index_unchanged: bool,
     _index_info: *mut pg_sys::IndexInfo,
 ) -> bool {
-    let index_relation = unsafe { PgRelation::from_pg(index_relation) };
-    let options: Options = index_relation.rd_options.try_into().unwrap_or_report();
-
     let mut insert_context = PgMemoryContexts::new(PROGRAM_NAME);
     let mut old_owned_context = unsafe { insert_context.set_as_current() };
+
+    let index_relation = unsafe { PgRelation::from_pg(index_relation) };
+    let options: Options = index_relation.rd_options.try_into().unwrap_or_report();
 
     let desc = unsafe { index_relation.rd_att.as_ref() }.unwrap();
     let natts = desc.natts as usize;
@@ -386,7 +486,7 @@ pub extern "C" fn aminsert(
     let attrs = unsafe { desc.attrs.as_slice(natts) };
 
     let document = form_document(heap_tid, isnull, values, attrs);
-    info!("pgmumbo aminsert: {document:?}");
+    info!("{PROGRAM_NAME} aminsert: {document:?}");
     let document_reader = documents_batch_reader_from_objects(iter::once(document));
 
     // Open the index for each tuple for now... ideally we'd like to cache this, possibly in the index relation
@@ -418,7 +518,7 @@ pub extern "C" fn aminsert(
         insert_context.reset();
     }
 
-    // pgmumbo does not perform uniqueness checks
+    // pgmumbo does not perform uniqueness checks (yet)
     false
 }
 
@@ -492,7 +592,7 @@ pub extern "C" fn amvacuumcleanup(
     _info: *mut pg_sys::IndexVacuumInfo,
     stats: *mut pg_sys::IndexBulkDeleteResult,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
-    info!("pgmumbo amvacuumcleanup");
+    info!("{PROGRAM_NAME} amvacuumcleanup");
     stats
 }
 
@@ -508,7 +608,7 @@ pub extern "C" fn amcostestimate(
     _index_correlation: *mut f64,
     _index_pages: *mut f64,
 ) {
-    info!("pgmumbo amcostestimate");
+    info!("{PROGRAM_NAME} amcostestimate");
 }
 
 #[derive(Serialize, Deserialize)]
@@ -557,7 +657,7 @@ struct Options {
         sub = "milli::CompressionType",
         serde(with = "MilliCompressionTypeDef")
     )]
-    mic_chunk_compression_type: Option<milli::CompressionType>,
+    mic_chunk_compression_type: Option<milli::CompressionType>, // TODO: open up crate features flags for compression
     mic_chunk_compression_level: Option<u32>,
     mic_max_positions_per_attributes: Option<u32>,
     mic_skip_index_budget: Option<bool>,
@@ -570,7 +670,7 @@ struct Options {
 
 #[pg_guard]
 pub extern "C" fn amoptions(reloptions: pg_sys::Datum, validate: bool) -> *mut pg_sys::bytea {
-    info!("pgmumbo amoptions... validate {validate}");
+    info!("{PROGRAM_NAME} amoptions, validate {validate}");
 
     // pgmumbo encodes options using CBOR as opposed to StdRdOptions.
     // Consequently, build_reloptions isn't used.
@@ -686,17 +786,33 @@ impl From<&Options> for milli::update::IndexDocumentsConfig {
 }
 
 #[pg_guard]
-pub extern "C" fn amvalidate(_opclassoid: Oid) -> bool {
-    info!("pgmumbo amvalidate");
+pub extern "C" fn amvalidate(_opclassoid: pg_sys::Oid) -> bool {
+    info!("{PROGRAM_NAME} amvalidate");
+    true
+}
+
+#[pg_extern]
+fn pgmumboquery_cmpfunc(anyelem: PgBox<pgrx::AnyElement>, query: PgmumboQuery) -> bool {
     true
 }
 
 extension_sql!(
-    "CREATE OPERATOR CLASS pgmumbo_ops_anyelement
+    "CREATE OPERATOR pg_catalog.@? (
+        FUNCTION = pgmumboquery_cmpfunc,
+        LEFTARG  = anyelement,
+        RIGHTARG = pgmumboquery
+    );",
+    name = "operator_pgmumboquery",
+    requires = [pgmumboquery_cmpfunc, PgmumboQuery],
+);
+
+extension_sql!(
+    "CREATE OPERATOR CLASS pgmumbo_ops_pgmumboquery
+        DEFAULT FOR TYPE anyelement
         USING pgmumbo AS
-        OPERATOR 1 pg_catalog.@@ (tid, pgmumboquery);",
+            OPERATOR 1 pg_catalog.@? (anyelement, pgmumboquery);",
     name = "operator_class_pgmumboquery",
-    requires = ["index_access_method"],
+    requires = ["index_access_method", "operator_pgmumboquery", PgmumboQuery],
 );
 
 const DEFAULT_SCAN_BATCH_SIZE: usize = 64; // Picked arbitrarily for now
@@ -722,7 +838,7 @@ struct ScanState {
 }
 
 #[derive(Default, Serialize, Deserialize, PostgresType)]
-struct Query {}
+struct PgmumboQuery {}
 
 #[pg_guard]
 pub extern "C" fn ambeginscan(
@@ -730,7 +846,7 @@ pub extern "C" fn ambeginscan(
     nkeys: ::std::os::raw::c_int,
     norderbys: ::std::os::raw::c_int,
 ) -> pg_sys::IndexScanDesc {
-    info!("pgmumbo ambeginscan");
+    info!("{PROGRAM_NAME} ambeginscan");
     let mut scan = unsafe {
         PgBox::from_pg(pg_sys::RelationGetIndexScan(
             index_relation,
@@ -776,7 +892,7 @@ pub extern "C" fn amrescan(
     orderbys: pg_sys::ScanKey,
     norderbys: ::std::os::raw::c_int,
 ) {
-    info!("pgmumbo amrescan");
+    info!("{PROGRAM_NAME} amrescan");
     let scan = unsafe { PgBox::from_pg(scan) };
     let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
 
@@ -809,7 +925,7 @@ pub extern "C" fn amgettuple(
     scan: pg_sys::IndexScanDesc,
     direction: pg_sys::ScanDirection::Type,
 ) -> bool {
-    info!("pgmumbo amgettuple");
+    info!("{PROGRAM_NAME} amgettuple");
     let scan = unsafe { PgBox::from_pg(scan) };
     let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
 
@@ -817,11 +933,7 @@ pub extern "C" fn amgettuple(
         pg_sys::ScanDirection::ForwardScanDirection => {}
         pg_sys::ScanDirection::BackwardScanDirection => {}
         pg_sys::ScanDirection::NoMovementScanDirection => {}
-        _ => ereport!(
-            ERROR,
-            PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
-            format!("Unsupported scan direction: {direction}")
-        ),
+        _ => error!("Unsupported scan direction: {direction}"),
     };
 
     false
@@ -829,7 +941,7 @@ pub extern "C" fn amgettuple(
 
 #[pg_guard]
 pub extern "C" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *mut pg_sys::TIDBitmap) -> i64 {
-    info!("pgmumbo ambitmapscan");
+    info!("{PROGRAM_NAME} amgetbitmap");
     let scan = unsafe { PgBox::from_pg(scan) };
     let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
 
@@ -858,7 +970,7 @@ pub extern "C" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *mut pg_sys::TID
 
     // Add the TID Vec to a TIDBitmap
     unsafe {
-        pg_sys::tbm_add_tuples(tbm, *tids.as_ptr(), tids.len() as i32, false);
+        pg_sys::tbm_add_tuples(tbm, *tids.as_ptr(), tids.len() as raw::c_int, false);
     }
 
     tids.len() as i64
@@ -866,7 +978,7 @@ pub extern "C" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *mut pg_sys::TID
 
 #[pg_guard]
 pub extern "C" fn amendscan(scan: pg_sys::IndexScanDesc) {
-    info!("pgmumbo amendscan");
+    info!("{PROGRAM_NAME} amendscan");
     let scan = unsafe { PgBox::from_pg(scan) };
 
     // Release state resources
