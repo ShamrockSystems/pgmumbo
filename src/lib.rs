@@ -322,7 +322,7 @@ extern "C" fn build_callback(
     values: *mut pg_sys::Datum,
     isnull: *mut bool,
     _tuple_is_alive: bool,
-    state: *mut std::os::raw::c_void,
+    state: *mut raw::c_void,
 ) {
     let build_state = unsafe { (state as *mut BuildState).as_mut() }.unwrap();
     let mut old_owned_context = unsafe { build_state.owned_context.set_as_current() };
@@ -520,7 +520,7 @@ pub extern "C" fn ambulkdelete(
     info: *mut pg_sys::IndexVacuumInfo,
     stats: *mut pg_sys::IndexBulkDeleteResult,
     callback: pg_sys::IndexBulkDeleteCallback,
-    callback_state: *mut ::std::os::raw::c_void,
+    callback_state: *mut raw::c_void,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
     let callback = callback.unwrap();
     let index_relation = unsafe { PgRelation::from_pg((*info).index) };
@@ -815,7 +815,7 @@ extension_sql!(
 const _DEFAULT_SCAN_BATCH_SIZE: usize = 64; // Picked arbitrarily for now
 
 #[self_referencing]
-struct ScanState {
+struct ScanOpaque {
     milli_index: milli::Index,
     #[borrows(milli_index)]
     #[covariant]
@@ -837,8 +837,8 @@ struct ScanState {
 #[pg_guard]
 pub extern "C" fn ambeginscan(
     index_relation: pg_sys::Relation,
-    nkeys: ::std::os::raw::c_int,
-    norderbys: ::std::os::raw::c_int,
+    nkeys: raw::c_int,
+    norderbys: raw::c_int,
 ) -> pg_sys::IndexScanDesc {
     info!("{PROGRAM_NAME} ambeginscan");
     let mut scan = unsafe {
@@ -855,8 +855,8 @@ pub extern "C" fn ambeginscan(
     let mut lmdb_options = heed::EnvOpenOptions::new();
     lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
     let milli_index = milli::Index::new(lmdb_options, index_path).unwrap_or_report();
-    // Initialize scan state
-    let state_builder = ScanStateBuilder {
+    // Initialize opaque
+    let opaque_builder = ScanOpaqueBuilder {
         milli_index,
         // Open an LMDB read transaction
         lmdb_rtxn_builder: |milli_index| milli_index.read_txn().unwrap_or_report(),
@@ -870,10 +870,10 @@ pub extern "C" fn ambeginscan(
         marked_page: Vec::default(),
         marked_idx: None,
     };
-    // Load the state into the scan description
-    let mut state = state_builder.build();
+    // Load opaque into the scan description
+    let mut opaque = opaque_builder.build();
     scan.opaque =
-        unsafe { PgBox::<ScanState>::from_rust(&mut state) }.into_pg() as *mut ffi::c_void;
+        unsafe { PgBox::<ScanOpaque>::from_rust(&mut opaque) }.into_pg() as *mut ffi::c_void;
 
     scan.into_pg()
 }
@@ -907,13 +907,13 @@ struct PgmumboQuery {
 pub extern "C" fn amrescan(
     scan: pg_sys::IndexScanDesc,
     keys: pg_sys::ScanKey,
-    nkeys: ::std::os::raw::c_int,
+    nkeys: raw::c_int,
     orderbys: pg_sys::ScanKey,
-    norderbys: ::std::os::raw::c_int,
+    norderbys: raw::c_int,
 ) {
     info!("{PROGRAM_NAME} amrescan");
     let scan = unsafe { PgBox::from_pg(scan) };
-    let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
+    let mut opaque = unsafe { PgBox::from_pg(scan.opaque as *mut ScanOpaque) };
 
     if !keys.is_null() && !orderbys.is_null() {
         let _keys = unsafe { slice::from_raw_parts(keys, nkeys as usize) };
@@ -929,13 +929,13 @@ pub extern "C" fn amrescan(
     // if ambitmapscan, then we translate the universe into TIDBitmap
     // if amgettuple, then we increase or decrease the search_idx, and grab a new cached page if needed
 
-    let mut universe = state
+    let mut universe = opaque
         .borrow_milli_index()
-        .documents_ids(state.borrow_lmdb_rtxn())
+        .documents_ids(opaque.borrow_lmdb_rtxn())
         .unwrap_or_report();
 
-    state.with_mut(|mut state| {
-        state.universe = &mut universe;
+    opaque.with_mut(|mut opaque| {
+        opaque.universe = &mut universe;
     });
 }
 
@@ -946,7 +946,7 @@ pub extern "C" fn amgettuple(
 ) -> bool {
     info!("{PROGRAM_NAME} amgettuple");
     let scan = unsafe { PgBox::from_pg(scan) };
-    let _state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
+    let _opaque = unsafe { PgBox::from_pg(scan.opaque as *mut ScanOpaque) };
 
     match direction {
         pg_sys::ScanDirection::ForwardScanDirection => {}
@@ -962,14 +962,14 @@ pub extern "C" fn amgettuple(
 pub extern "C" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *mut pg_sys::TIDBitmap) -> i64 {
     info!("{PROGRAM_NAME} amgetbitmap");
     let scan = unsafe { PgBox::from_pg(scan) };
-    let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
+    let mut opaque = unsafe { PgBox::from_pg(scan.opaque as *mut ScanOpaque) };
 
     // Convert the universe into a Vec of TIDs
     let mut tids = Vec::new();
-    state.with_mut(|state| {
-        let universe = state.universe.clone();
-        let rtxn = state.lmdb_rtxn;
-        let milli_index = state.milli_index;
+    opaque.with_mut(|opaque| {
+        let universe = opaque.universe.clone();
+        let rtxn = opaque.lmdb_rtxn;
+        let milli_index = opaque.milli_index;
         let milli_index_fields = milli_index.fields_ids_map(rtxn).unwrap_or_report();
         let milli_primary_key =
             milli::documents::PrimaryKey::new(TID_PRIMARY_KEY, &milli_index_fields).unwrap();
@@ -1000,14 +1000,14 @@ pub extern "C" fn amendscan(scan: pg_sys::IndexScanDesc) {
     info!("{PROGRAM_NAME} amendscan");
     let scan = unsafe { PgBox::from_pg(scan) };
 
-    // Release state resources
-    let mut state = unsafe { PgBox::from_pg(scan.opaque as *mut ScanState) };
-    state.with_mut(|state| {
-        unsafe { ptr::read(state.lmdb_rtxn) }
+    // Release opaque resources
+    let mut opaque = unsafe { PgBox::from_pg(scan.opaque as *mut ScanOpaque) };
+    opaque.with_mut(|opaque| {
+        unsafe { ptr::read(opaque.lmdb_rtxn) }
             .commit()
             .unwrap_or_report();
     });
-    drop(state);
+    drop(opaque);
     unsafe { pg_sys::pfree(scan.opaque) };
 }
 
