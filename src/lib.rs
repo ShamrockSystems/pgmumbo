@@ -7,13 +7,16 @@ use std::{
     fs,
     io::{self, Cursor},
     iter::{self, zip},
+    mem,
     num::{NonZeroU32, ParseIntError},
+    ops::DerefMut,
     os::raw,
     path::{Path, PathBuf},
     ptr, slice,
     sync::LazyLock,
 };
 
+use itertools::{izip, multizip, Itertools};
 use milli::{
     documents::{documents_batch_reader_from_objects, DocumentsBatchBuilder, DocumentsBatchReader},
     heed,
@@ -130,6 +133,9 @@ pub extern "C" fn _PG_init() {
     });
     unsafe { pg_sys::object_access_hook = Some(pgmumbo_oat_hook) };
 }
+
+// TODO Create a planner hook to modify any plan containing the operator to contain an index scan
+// TODO Create an executor start hook to throw an error if the operator is being used without an index scan
 
 extension_sql!(
     // Language=SQL
@@ -361,11 +367,11 @@ fn tid_to_name(ptr: pg_sys::ItemPointer) -> String {
     )
 }
 
-fn name_to_tid(s: &str) -> Result<pg_sys::ItemPointer, Error> {
+fn name_to_tid(s: &str) -> Result<pg_sys::ItemPointerData, Error> {
     let (blk_str, pos_str) = s.split_once('_').ok_or(Error::TidSplit)?;
     let (blk_hi_str, blk_lo_str) = blk_str.split_once('-').ok_or(Error::TidSplit)?;
 
-    Ok(&mut pg_sys::ItemPointerData {
+    Ok(pg_sys::ItemPointerData {
         ip_blkid: pg_sys::BlockIdData {
             bi_hi: blk_hi_str.parse().map_err(Error::TidParseInt)?,
             bi_lo: blk_lo_str.parse().map_err(Error::TidParseInt)?,
@@ -380,7 +386,6 @@ fn form_document(
     values: &[pg_sys::Datum],
     attrs: &[pg_sys::FormData_pg_attribute],
 ) -> serde_json::Map<String, serde_json::Value> {
-    let it = zip(isnull, zip(attrs, values));
     serde_json::Map::from_iter(
         // Managed primary key; 1:1 mapping with TID
         iter::once((
@@ -388,28 +393,32 @@ fn form_document(
             serde_json::Value::String(tid_to_name(tid)),
         ))
         // Then, convert INCLUDE clause tuple attrs and values to KV pairs
-        .chain(it.filter_map(|(isnull, (attr, value))| {
-            if *isnull {
-                return None;
-            }
-            let detoasted = unsafe { pg_sys::pg_detoast_datum(value.cast_mut_ptr()) };
-            let document_key = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
-                .to_str()
-                .unwrap_or_report()
-                .to_string();
-            let document_value = match attr.atttypid {
-                pg_sys::TEXTOID => serde_json::Value::String(
-                    unsafe {
-                        CStr::from_ptr(pg_sys::text_to_cstring(detoasted.cast::<pg_sys::text>()))
-                    }
+        .chain(
+            izip!(isnull, attrs, values).filter_map(|(isnull, attr, value)| {
+                if *isnull {
+                    return None;
+                }
+                let detoasted = unsafe { pg_sys::pg_detoast_datum(value.cast_mut_ptr()) };
+                let document_key = unsafe { CStr::from_ptr(attr.attname.data.as_ptr()) }
                     .to_str()
                     .unwrap_or_report()
-                    .to_string(),
-                ),
-                _ => serde_json::Value::Null,
-            };
-            Some((document_key, document_value))
-        })),
+                    .to_string();
+                let document_value = match attr.atttypid {
+                    pg_sys::TEXTOID => serde_json::Value::String(
+                        unsafe {
+                            CStr::from_ptr(pg_sys::text_to_cstring(
+                                detoasted.cast::<pg_sys::text>(),
+                            ))
+                        }
+                        .to_str()
+                        .unwrap_or_report()
+                        .to_string(),
+                    ),
+                    _ => serde_json::Value::Null,
+                };
+                Some((document_key, document_value))
+            }),
+        ),
     )
 }
 
@@ -551,7 +560,7 @@ pub extern "C" fn ambulkdelete(
             .unwrap()
             .map_err(|_| todo!())
             .unwrap();
-        let tid = name_to_tid(&pk_value).unwrap_or_report();
+        let tid = &mut name_to_tid(&pk_value).unwrap_or_report();
         let should_delete = unsafe { callback(tid, callback_state) };
         if should_delete {
             to_delete.push(pk_value);
@@ -595,13 +604,19 @@ pub extern "C" fn amcostestimate(
     _root: *mut pg_sys::PlannerInfo,
     _path: *mut pg_sys::IndexPath,
     _loop_count: f64,
-    _index_startup_cost: *mut pg_sys::Cost,
-    _index_total_cost: *mut pg_sys::Cost,
-    _index_selectivity: *mut pg_sys::Selectivity,
-    _index_correlation: *mut f64,
-    _index_pages: *mut f64,
+    index_startup_cost: *mut pg_sys::Cost,
+    index_total_cost: *mut pg_sys::Cost,
+    index_selectivity: *mut pg_sys::Selectivity,
+    index_correlation: *mut f64,
+    index_pages: *mut f64,
 ) {
-    info!("{PROGRAM_NAME} amcostestimate");
+    info!("{PROGRAM_NAME} amcostestimate (phony)");
+    // TODO this is kinda bad... i need to justify these numbers
+    unsafe { *index_startup_cost = 0.0 };
+    unsafe { *index_total_cost = -pg_sys::random_page_cost };
+    unsafe { *index_selectivity = 0.5 };
+    unsafe { *index_correlation = 1.0 };
+    unsafe { *index_pages = 1.0 };
 }
 
 #[derive(Serialize, Deserialize)]
@@ -777,63 +792,7 @@ impl From<&Options> for milli::update::IndexDocumentsConfig {
         }
     }
 }
-/*
-#include "postgres.h"
-#include "optimizer/planner.h"
-#include "executor/executor.h"
 
-PG_MODULE_MAGIC;
-
-static planner_hook_type prev_planner_hook = NULL;
-static ExecutorStart_hook_type prev_ExecutorStart = NULL;
-
-static PlannedStmt *
-my_planner_hook(Query *parse, int cursorOptions, ParamListInfo boundParams)
-{
-    PlannedStmt *result;
-
-    if (prev_planner_hook)
-        result = prev_planner_hook(parse, cursorOptions, boundParams);
-    else
-        result = standard_planner(parse, cursorOptions, boundParams);
-
-    // Here, modify the plan to prefer index scans for your operator
-    // This is a simplification; you'd need to traverse the plan tree
-    if (plan_contains_my_operator(result))
-    {
-        prefer_index_scans(result);
-    }
-
-    return result;
-}
-
-static void
-my_ExecutorStart(QueryDesc *queryDesc, int eflags)
-{
-    if (prev_ExecutorStart)
-        prev_ExecutorStart(queryDesc, eflags);
-    else
-        standard_ExecutorStart(queryDesc, eflags);
-
-    // Check if the plan contains your operator and is not an index scan
-    if (plan_contains_my_operator(queryDesc->plannedstmt) &&
-        !is_index_scan(queryDesc->plannedstmt))
-    {
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("Custom operator can only be used in index scans")));
-    }
-}
-
-void
-_PG_init(void)
-{
-    prev_planner_hook = planner_hook;
-    planner_hook = my_planner_hook;
-
-    prev_ExecutorStart = ExecutorStart_hook;
-    ExecutorStart_hook = my_ExecutorStart;
-} */
 #[pg_guard]
 pub extern "C" fn amvalidate(_opclassoid: pg_sys::Oid) -> bool {
     info!("{PROGRAM_NAME} amvalidate");
@@ -850,11 +809,9 @@ fn pgmumboquery_cmpfunc(
     _fcinfo: pg_sys::FunctionCallInfo,
     _anyelement: PgBox<&str>,
     _query: PgBox<PgmumboQuery>,
-) -> f64 {
-    // cmpfunc usage is up to the discretion of the index.
-    // This is a somewhat meaningless value outside of SELECT for now.
-    info!("{PROGRAM_NAME} cmpfunc");
-    0.0
+) -> bool {
+    // It doesnt make sense to compare against things that aren't column attribute numbers
+    error!("{PROGRAM_NAME} cmpfunc not valid on unindexed column");
 }
 
 #[pg_extern(immutable, parallel_safe)]
@@ -871,7 +828,8 @@ extension_sql!(
     "CREATE OPERATOR pg_catalog.@? (
         FUNCTION = pgmumboquery_cmpfunc,
         LEFTARG  = text,
-        RIGHTARG = pgmumboquery
+        RIGHTARG = pgmumboquery,
+        RESTRICT = pgmumboquery_restrict
     );",
     name = "operator_pgmumboquery",
     requires = [pgmumboquery_cmpfunc, PgmumboQuery],
@@ -881,7 +839,7 @@ extension_sql!(
     "CREATE OPERATOR CLASS pgmumbo_ops_pgmumboquery
         DEFAULT FOR TYPE text
         USING pgmumbo AS
-            OPERATOR 1 @?(text, pgmumboquery) FOR ORDER BY float_ops;",
+            OPERATOR 1 @?(text, pgmumboquery);",
     name = "operator_class_pgmumboquery",
     requires = ["index_access_method", "operator_pgmumboquery", PgmumboQuery],
 );
@@ -916,7 +874,7 @@ pub extern "C" fn ambeginscan(
 ) -> pg_sys::IndexScanDesc {
     info!("{PROGRAM_NAME} ambeginscan");
     let mut scan = unsafe {
-        PgBox::from_pg(pg_sys::RelationGetIndexScan(
+        PgBox::<pg_sys::IndexScanDescData>::from_rust(pg_sys::RelationGetIndexScan(
             index_relation,
             nkeys,
             norderbys,
@@ -928,10 +886,9 @@ pub extern "C" fn ambeginscan(
     let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
     let mut lmdb_options = heed::EnvOpenOptions::new();
     lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
-    let milli_index = milli::Index::new(lmdb_options, index_path).unwrap_or_report();
     // Initialize opaque
     let opaque_builder = ScanOpaqueBuilder {
-        milli_index,
+        milli_index: milli::Index::new(lmdb_options, index_path).unwrap_or_report(),
         // Open an LMDB read transaction
         lmdb_rtxn_builder: |milli_index| milli_index.read_txn().unwrap_or_report(),
         // Open up a search context
@@ -944,11 +901,9 @@ pub extern "C" fn ambeginscan(
         marked_page: Vec::default(),
         marked_idx: None,
     };
-    // Load opaque into the scan description
-    let mut opaque = opaque_builder.build();
-    scan.opaque =
-        unsafe { PgBox::<ScanOpaque>::from_rust(&mut opaque) }.into_pg() as *mut ffi::c_void;
-
+    // Load opaque into the scan description, free during amendscan
+    let opaque = opaque_builder.build();
+    scan.opaque = Box::into_raw(Box::new(opaque)) as *mut ffi::c_void;
     scan.into_pg()
 }
 
@@ -967,7 +922,7 @@ enum MilliScoringStrategyDef {
     Detailed,
 }
 
-#[derive(Default, Serialize, Deserialize, PostgresType)]
+#[derive(Debug, Clone, Eq, PartialEq, Default, Serialize, Deserialize, PostgresType)]
 struct PgmumboQuery {
     query: Option<String>,
     filter: Option<String>,
@@ -988,11 +943,35 @@ pub extern "C" fn amrescan(
     info!("{PROGRAM_NAME} amrescan");
     let scan = unsafe { PgBox::from_pg(scan) };
     let mut opaque = unsafe { PgBox::from_pg(scan.opaque as *mut ScanOpaque) };
+    let index_relation = unsafe { PgRelation::from_pg(scan.indexRelation) };
+    let desc = unsafe { index_relation.rd_att.as_ref() }.unwrap();
+    let natts = desc.natts as usize;
+    let attrs = unsafe { desc.attrs.as_slice(natts) };
 
     if !keys.is_null() {
         // Need to restart scan with new values; limit universe and apply settings
         let keys = unsafe { slice::from_raw_parts(keys, nkeys as usize) };
         info!("{keys:?}");
+
+        // Gather queries on columns
+        let queries: Vec<(PgmumboQuery, HashSet<&str>)> = keys
+            .iter()
+            .map(|scan_key| {
+                let att_idx = (scan_key.sk_attno - 1) as usize;
+                let att_name = unsafe { CStr::from_ptr(attrs[att_idx].attname.data.as_ptr()) }
+                    .to_str()
+                    .unwrap_or_report();
+                let argument = unsafe {
+                    PgmumboQuery::from_datum(scan_key.sk_argument, scan_key.sk_argument.is_null())
+                }
+                .unwrap();
+                (argument, att_name)
+            })
+            .chunk_by(|x| x.0.clone())
+            .into_iter()
+            .map(|(k, v)| (k, v.map(|(_, v)| v).collect::<HashSet<&str>>()))
+            .collect();
+        info!("{queries:?}");
 
         opaque.with_mut(|opaque| {
             let mut tokbuilder = milli::tokenizer::TokenizerBuilder::new();
@@ -1036,13 +1015,12 @@ pub extern "C" fn amrescan(
     // if ambitmapscan, then we translate the universe into TIDBitmap
     // if amgettuple, then we increase or decrease the search_idx, and grab a new cached page if needed
 
-    let mut universe = opaque
-        .borrow_milli_index()
-        .documents_ids(opaque.borrow_lmdb_rtxn())
-        .unwrap_or_report();
-
-    opaque.with_mut(|mut opaque| {
-        opaque.universe = &mut universe;
+    opaque.with_mut(|opaque| {
+        *opaque.universe = opaque
+            .milli_context
+            .index
+            .documents_ids(opaque.milli_context.txn)
+            .unwrap_or_report();
     });
 }
 
@@ -1068,6 +1046,7 @@ pub extern "C" fn amgettuple(
 #[pg_guard]
 pub extern "C" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *mut pg_sys::TIDBitmap) -> i64 {
     info!("{PROGRAM_NAME} amgetbitmap");
+    let tbm = unsafe { PgBox::from_pg(tbm) };
     let scan = unsafe { PgBox::from_pg(scan) };
     let mut opaque = unsafe { PgBox::from_pg(scan.opaque as *mut ScanOpaque) };
 
@@ -1096,7 +1075,12 @@ pub extern "C" fn amgetbitmap(scan: pg_sys::IndexScanDesc, tbm: *mut pg_sys::TID
 
     // Add the TID Vec to a TIDBitmap
     unsafe {
-        pg_sys::tbm_add_tuples(tbm, *tids.as_ptr(), tids.len() as raw::c_int, false);
+        pg_sys::tbm_add_tuples(
+            tbm.into_pg(),
+            tids.as_mut_ptr(),
+            tids.len() as raw::c_int,
+            false,
+        );
     }
 
     tids.len() as i64
@@ -1108,14 +1092,11 @@ pub extern "C" fn amendscan(scan: pg_sys::IndexScanDesc) {
     let scan = unsafe { PgBox::from_pg(scan) };
 
     // Release opaque resources
-    let mut opaque = unsafe { PgBox::from_pg(scan.opaque as *mut ScanOpaque) };
-    opaque.with_mut(|opaque| {
-        unsafe { ptr::read(opaque.lmdb_rtxn) }
-            .commit()
-            .unwrap_or_report();
-    });
+    let opaque = unsafe { PgBox::from_pg(scan.opaque as *mut ScanOpaque) };
+    unsafe { ptr::read(opaque.borrow_lmdb_rtxn()) }
+        .commit()
+        .unwrap_or_report();
     drop(opaque);
-    unsafe { pg_sys::pfree(scan.opaque) };
 }
 
 #[derive(Error, Debug)]
