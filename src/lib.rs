@@ -143,7 +143,8 @@ extension_sql!(
 // Not sure if pgrx allows for custom return types without overriding SQL.
 // Postgres expects the amhandler to return index_am_handler
 #[pg_extern(sql = "
-    CREATE OR REPLACE FUNCTION pgmumbo_amhandler(internal) RETURNS index_am_handler
+    CREATE OR REPLACE FUNCTION pgmumbo_amhandler(internal)
+        RETURNS index_am_handler
         STRICT
         LANGUAGE c
         AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';")]
@@ -155,7 +156,7 @@ fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine>
     amroutine.amsupport = 0;
     amroutine.amoptsprocnum = 0;
     amroutine.amcanorder = false;
-    amroutine.amcanorderbyop = false; // Check if this applies to ranking
+    amroutine.amcanorderbyop = true;
     amroutine.amcanbackward = false;
     amroutine.amcanunique = false;
     amroutine.amcanmulticol = true;
@@ -783,30 +784,48 @@ pub extern "C" fn amvalidate(_opclassoid: pg_sys::Oid) -> bool {
     true
 }
 
-#[pg_extern]
-fn pgmumboquery_op(
+#[pg_extern(sql = "
+    CREATE FUNCTION pgmumboquery_cmpfunc(text, PgmumboQuery)
+        RETURNS boolean
+        STRICT
+        LANGUAGE c
+        AS '@MODULE_PATHNAME@', '@FUNCTION_NAME@';")]
+fn pgmumboquery_cmpfunc(
     _fcinfo: pg_sys::FunctionCallInfo,
-    _anyelement: PgBox<pgrx::AnyElement>,
-    query: PgBox<PgmumboQuery>,
-) -> PgBox<PgmumboQuery> {
-    query
+    _anyelement: PgBox<&str>,
+    _query: PgBox<PgmumboQuery>,
+) -> f64 {
+    // cmpfunc usage is up to the discretion of the index.
+    // This is a somewhat meaningless value outside of SELECT for now.
+    info!("{PROGRAM_NAME} cmpfunc");
+    0.0
+}
+
+#[pg_extern(immutable, parallel_safe)]
+fn pgmumboquery_restrict(
+    _planner_info: pgrx::Internal,
+    _operator_oid: pg_sys::Oid,
+    _args: pgrx::Internal,
+    _var_relid: i32,
+) -> f64 {
+    0.0
 }
 
 extension_sql!(
     "CREATE OPERATOR pg_catalog.@? (
-        FUNCTION = pgmumboquery_op,
-        LEFTARG  = anyelement,
+        FUNCTION = pgmumboquery_cmpfunc,
+        LEFTARG  = text,
         RIGHTARG = pgmumboquery
     );",
     name = "operator_pgmumboquery",
-    requires = [pgmumboquery_op, PgmumboQuery],
+    requires = [pgmumboquery_cmpfunc, PgmumboQuery],
 );
 
 extension_sql!(
     "CREATE OPERATOR CLASS pgmumbo_ops_pgmumboquery
-        DEFAULT FOR TYPE anyelement
+        DEFAULT FOR TYPE text
         USING pgmumbo AS
-            OPERATOR 1 pg_catalog.@? (anyelement, pgmumboquery);",
+            OPERATOR 1 @?(text, pgmumboquery) FOR ORDER BY float_ops;",
     name = "operator_class_pgmumboquery",
     requires = ["index_access_method", "operator_pgmumboquery", PgmumboQuery],
 );
@@ -907,22 +926,53 @@ pub extern "C" fn amrescan(
     scan: pg_sys::IndexScanDesc,
     keys: pg_sys::ScanKey,
     nkeys: raw::c_int,
-    orderbys: pg_sys::ScanKey,
-    norderbys: raw::c_int,
+    _orderbys: pg_sys::ScanKey,
+    _norderbys: raw::c_int,
 ) {
     info!("{PROGRAM_NAME} amrescan");
     let scan = unsafe { PgBox::from_pg(scan) };
     let mut opaque = unsafe { PgBox::from_pg(scan.opaque as *mut ScanOpaque) };
 
-    if !keys.is_null() && !orderbys.is_null() {
+    if !keys.is_null() {
+        // Need to restart scan with new values; limit universe and apply settings
         let keys = unsafe { slice::from_raw_parts(keys, nkeys as usize) };
-        let orderbys = unsafe { slice::from_raw_parts(orderbys, norderbys as usize) };
+        info!("{keys:?}");
 
-        info!("{keys:?}\n{orderbys:?}");
+        opaque.with_mut(|opaque| {
+            let mut tokbuilder = milli::tokenizer::TokenizerBuilder::new();
+            let rtxn = opaque.lmdb_rtxn;
+            let ctx = opaque.milli_context;
+
+            let stop_words = ctx.index.stop_words(rtxn).unwrap_or_report();
+            if let Some(ref stop_words) = stop_words {
+                tokbuilder.stop_words(stop_words);
+            }
+
+            let separators = ctx.index.allowed_separators(rtxn).unwrap_or_report();
+            let separators: Option<Vec<_>> = separators
+                .as_ref()
+                .map(|x| x.iter().map(String::as_str).collect());
+            if let Some(ref separators) = separators {
+                tokbuilder.separators(separators);
+            }
+
+            let dictionary = ctx.index.dictionary(rtxn).unwrap_or_report();
+            let dictionary: Option<Vec<_>> = dictionary
+                .as_ref()
+                .map(|x| x.iter().map(String::as_str).collect());
+            if let Some(ref dictionary) = dictionary {
+                tokbuilder.words_dict(dictionary);
+            }
+
+            let script_lang_map = ctx.index.script_language(rtxn).unwrap_or_report();
+            if !script_lang_map.is_empty() {
+                tokbuilder.allow_list(&script_lang_map);
+            }
+
+            let tokenizer = tokbuilder.build();
+            let _tokens = tokenizer.tokenize("TODO query");
+        });
     }
-
-    // Need to restart scan with new values, TODO limit universe and apply settings
-    // if !keys.is_null() && !orderbys.is_null() {}
 
     // execute_search allows as to both paginate forwards and backwards on results in the same rtxn
     // so it enables us to support both linear scans and bitmaps
