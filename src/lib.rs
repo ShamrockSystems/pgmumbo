@@ -777,7 +777,63 @@ impl From<&Options> for milli::update::IndexDocumentsConfig {
         }
     }
 }
+/*
+#include "postgres.h"
+#include "optimizer/planner.h"
+#include "executor/executor.h"
 
+PG_MODULE_MAGIC;
+
+static planner_hook_type prev_planner_hook = NULL;
+static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+
+static PlannedStmt *
+my_planner_hook(Query *parse, int cursorOptions, ParamListInfo boundParams)
+{
+    PlannedStmt *result;
+
+    if (prev_planner_hook)
+        result = prev_planner_hook(parse, cursorOptions, boundParams);
+    else
+        result = standard_planner(parse, cursorOptions, boundParams);
+
+    // Here, modify the plan to prefer index scans for your operator
+    // This is a simplification; you'd need to traverse the plan tree
+    if (plan_contains_my_operator(result))
+    {
+        prefer_index_scans(result);
+    }
+
+    return result;
+}
+
+static void
+my_ExecutorStart(QueryDesc *queryDesc, int eflags)
+{
+    if (prev_ExecutorStart)
+        prev_ExecutorStart(queryDesc, eflags);
+    else
+        standard_ExecutorStart(queryDesc, eflags);
+
+    // Check if the plan contains your operator and is not an index scan
+    if (plan_contains_my_operator(queryDesc->plannedstmt) &&
+        !is_index_scan(queryDesc->plannedstmt))
+    {
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("Custom operator can only be used in index scans")));
+    }
+}
+
+void
+_PG_init(void)
+{
+    prev_planner_hook = planner_hook;
+    planner_hook = my_planner_hook;
+
+    prev_ExecutorStart = ExecutorStart_hook;
+    ExecutorStart_hook = my_ExecutorStart;
+} */
 #[pg_guard]
 pub extern "C" fn amvalidate(_opclassoid: pg_sys::Oid) -> bool {
     info!("{PROGRAM_NAME} amvalidate");
