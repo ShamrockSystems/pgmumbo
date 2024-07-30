@@ -6,17 +6,15 @@ use std::{
     ffi::{self, CStr},
     fs,
     io::{self, Cursor},
-    iter::{self, zip},
-    mem,
+    iter::{self},
     num::{NonZeroU32, ParseIntError},
-    ops::DerefMut,
     os::raw,
     path::{Path, PathBuf},
     ptr, slice,
     sync::LazyLock,
 };
 
-use itertools::{izip, multizip, Itertools};
+use itertools::{izip, Itertools};
 use milli::{
     documents::{documents_batch_reader_from_objects, DocumentsBatchBuilder, DocumentsBatchReader},
     heed,
@@ -937,8 +935,8 @@ pub extern "C" fn amrescan(
     scan: pg_sys::IndexScanDesc,
     keys: pg_sys::ScanKey,
     nkeys: raw::c_int,
-    _orderbys: pg_sys::ScanKey,
-    _norderbys: raw::c_int,
+    orderbys: pg_sys::ScanKey,
+    norderbys: raw::c_int,
 ) {
     info!("{PROGRAM_NAME} amrescan");
     let scan = unsafe { PgBox::from_pg(scan) };
@@ -948,14 +946,24 @@ pub extern "C" fn amrescan(
     let natts = desc.natts as usize;
     let attrs = unsafe { desc.attrs.as_slice(natts) };
 
-    if !keys.is_null() {
+    if !keys.is_null() || !orderbys.is_null() {
         // Need to restart scan with new values; limit universe and apply settings
-        let keys = unsafe { slice::from_raw_parts(keys, nkeys as usize) };
-        info!("{keys:?}");
+        let keys = if keys.is_null() {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(keys, nkeys as usize) }
+        };
+        let orderbys = if orderbys.is_null() {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(orderbys, norderbys as usize) }
+        };
+        info!("{keys:?},{orderbys:?}");
 
         // Gather queries on columns
         let queries: Vec<(PgmumboQuery, HashSet<&str>)> = keys
             .iter()
+            .chain(orderbys)
             .map(|scan_key| {
                 let att_idx = (scan_key.sk_attno - 1) as usize;
                 let att_name = unsafe { CStr::from_ptr(attrs[att_idx].attname.data.as_ptr()) }
