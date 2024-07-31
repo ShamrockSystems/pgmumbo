@@ -39,6 +39,28 @@ thread_local! {
     static EXISTING_OBJECT_ACCESS_HOOK: object_access_hook_type = None;
 }
 
+#[derive(Clone)]
+struct Cache {
+    milli_index: milli::Index,
+}
+
+impl From<&PgRelation> for &Cache {
+    fn from(index_relation: &PgRelation) -> Self {
+        if index_relation.rd_amcache.is_null() {
+            info!("{PROGRAM_NAME}: opening up a new index");
+            // Open up an index
+            let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
+            let mut lmdb_options = heed::EnvOpenOptions::new();
+            lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE); // TODO discover map size if possible
+            // Probably would be better to find a better memory context and leak into it
+            let cache: *mut Cache = unsafe { PgMemoryContexts::CacheMemoryContext.palloc_struct() };
+            unsafe { &mut *cache }.milli_index =
+                milli::Index::new(lmdb_options, index_path).unwrap_or_report();
+        }
+        unsafe { &*(index_relation.rd_amcache as *mut Cache) }
+    }
+}
+
 #[allow(non_snake_case)]
 #[pg_guard]
 pub extern "C" fn _PG_init() {
@@ -239,9 +261,7 @@ pub extern "C" fn ambuild(
     }
     fs::create_dir_all(&index_path).unwrap_or_report();
 
-    let mut lmdb_options = heed::EnvOpenOptions::new();
-    lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
-    let milli_index = milli::Index::new(lmdb_options, &index_path).unwrap_or_report();
+    let cache: &Cache = (&index_relation).into();
 
     let mut build_state = BuildState {
         owned_context: PgMemoryContexts::new(PROGRAM_NAME),
@@ -259,12 +279,12 @@ pub extern "C" fn ambuild(
     }
 
     let documents = build_state.batch_builder.into_inner().unwrap_or_report();
-    let mut wtxn = milli_index.write_txn().unwrap_or_report();
+    let mut wtxn = cache.milli_index.write_txn().unwrap_or_report();
 
     let milli_idx_config: milli::update::IndexerConfig = (&options).into();
     let milli_idx_doc_config: milli::update::IndexDocumentsConfig = (&options).into();
     let mut milli_settings =
-        milli::update::Settings::new(&mut wtxn, &milli_index, &milli_idx_config);
+        milli::update::Settings::new(&mut wtxn, &cache.milli_index, &milli_idx_config);
     milli_settings.set_primary_key(TID_PRIMARY_KEY.to_string());
     macro_rules! set_ms_option {
         ($option:ident, $method:ident) => {
@@ -298,7 +318,7 @@ pub extern "C" fn ambuild(
 
     let mut indexer = milli::update::IndexDocuments::new(
         &mut wtxn,
-        &milli_index,
+        &cache.milli_index,
         &milli_idx_config,
         milli_idx_doc_config,
         |_| {},
@@ -481,6 +501,7 @@ pub extern "C" fn aminsert(
 
     let index_relation = unsafe { PgRelation::from_pg(index_relation) };
     let options: Options = index_relation.rd_options.try_into().unwrap_or_report();
+    let cache: &Cache = (&index_relation).into();
 
     let desc = unsafe { index_relation.rd_att.as_ref() }.unwrap();
     let natts = desc.natts as usize;
@@ -493,19 +514,13 @@ pub extern "C" fn aminsert(
     info!("{PROGRAM_NAME} aminsert: {document:?}");
     let document_reader = documents_batch_reader_from_objects(iter::once(document));
 
-    // Open the index for each tuple for now... ideally we'd like to cache this, possibly in the index relation
-    let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
-    let mut lmdb_options = heed::EnvOpenOptions::new();
-    lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
-    let milli_index = milli::Index::new(lmdb_options, index_path).unwrap_or_report();
-
     // Insert the document into the index
-    let mut wtxn = milli_index.write_txn().unwrap_or_report();
+    let mut wtxn = cache.milli_index.write_txn().unwrap_or_report();
     let milli_idx_config: milli::update::IndexerConfig = (&options).into();
     let milli_idx_doc_config: milli::update::IndexDocumentsConfig = (&options).into();
     let indexer = milli::update::IndexDocuments::new(
         &mut wtxn,
-        &milli_index,
+        &cache.milli_index,
         &milli_idx_config,
         milli_idx_doc_config,
         |_| {},
@@ -536,6 +551,7 @@ pub extern "C" fn ambulkdelete(
     let callback = callback.unwrap();
     let index_relation = unsafe { PgRelation::from_pg((*info).index) };
     let options: Options = index_relation.rd_options.try_into().unwrap_or_report();
+    let cache: &Cache = (&index_relation).into();
 
     let stats = if stats.is_null() {
         unsafe { PgBox::<pg_sys::IndexBulkDeleteResult>::alloc0() }.into_pg_boxed()
@@ -543,19 +559,14 @@ pub extern "C" fn ambulkdelete(
         unsafe { PgBox::from_pg(stats) }
     };
 
-    // Open up an index
-    let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
-    let mut lmdb_options = heed::EnvOpenOptions::new();
-    lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
-    let milli_index = milli::Index::new(lmdb_options, index_path).unwrap_or_report();
 
     // Gather external document IDs for deletion
-    let mut to_delete = Vec::new();
-    let mut wtxn = milli_index.write_txn().unwrap_or_report();
-    let milli_index_fields = milli_index.fields_ids_map(&wtxn).unwrap_or_report();
+    let mut to_delete: Vec<String> = Vec::new();
+    let mut wtxn = cache.milli_index.write_txn().unwrap_or_report();
+    let milli_index_fields = cache.milli_index.fields_ids_map(&wtxn).unwrap_or_report();
     let milli_primary_key =
         milli::documents::PrimaryKey::new(TID_PRIMARY_KEY, &milli_index_fields).unwrap();
-    for document in milli_index.all_documents(&wtxn).unwrap_or_report() {
+    for document in cache.milli_index.all_documents(&wtxn).unwrap_or_report() {
         let (_, kv_reader) = document.unwrap_or_report();
         let pk_value = milli_primary_key
             .document_id(&kv_reader, &milli_index_fields)
@@ -576,7 +587,7 @@ pub extern "C" fn ambulkdelete(
     let milli_idx_doc_config: milli::update::IndexDocumentsConfig = (&options).into();
     let indexer = milli::update::IndexDocuments::new(
         &mut wtxn,
-        &milli_index,
+        &cache.milli_index,
         &milli_idx_config,
         milli_idx_doc_config,
         |_| (),
@@ -888,14 +899,11 @@ pub extern "C" fn ambeginscan(
         ))
     };
     let index_relation = unsafe { PgRelation::from_pg(index_relation) };
+    let cache: &Cache = (&index_relation).into();
 
-    // Open up an index
-    let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
-    let mut lmdb_options = heed::EnvOpenOptions::new();
-    lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
     // Initialize opaque
     let opaque_builder = ScanOpaqueBuilder {
-        milli_index: milli::Index::new(lmdb_options, index_path).unwrap_or_report(),
+        milli_index: cache.milli_index.clone(),
         // Open an LMDB read transaction
         lmdb_rtxn_builder: |milli_index| milli_index.read_txn().unwrap_or_report(),
         // Open up a search context
@@ -993,7 +1001,7 @@ pub extern "C" fn amrescan(
         .collect();
     // Produce the final PgmumboQuery
     if queries.len() != 1 {
-        error!("pgmumbo does not support dissimilar queries on multiple columns")
+        error!("pgmumbo does not currently support dissimilar queries on multiple columns")
     }
     let (query, document_keys) = queries.pop().unwrap();
     let document_keys: Vec<String> = document_keys.into_iter().map(|x| x.to_string()).collect();
@@ -1003,8 +1011,7 @@ pub extern "C" fn amrescan(
     //
     // if ambitmapscan, then we translate the universe into TIDBitmap
     // if amgettuple, then we increase or decrease the search_idx, and grab a new cached page if needed
-    let heads = opaque.into_heads();
-    heads.
+    // let heads = opaque.into_heads();
 }
 
 #[pg_guard]
