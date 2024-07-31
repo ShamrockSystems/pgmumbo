@@ -2,12 +2,15 @@
 
 use std::{
     borrow::BorrowMut,
+    cell::OnceCell,
     collections::{BTreeMap, BTreeSet, HashSet},
     ffi::{self, CStr},
     fs,
     io::{self, Cursor},
     iter::{self},
+    mem,
     num::{NonZeroU32, ParseIntError},
+    ops::DerefMut,
     os::raw,
     path::{Path, PathBuf},
     ptr, slice,
@@ -163,7 +166,8 @@ fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine>
     amroutine.amcanorderbyop = true;
     amroutine.amcanbackward = false;
     amroutine.amcanunique = false;
-    amroutine.amcanmulticol = true;
+    amroutine.amcanmulticol = true; // Support multiple index columns
+    amroutine.amoptionalkey = true; // Support index scans omitting the first index column
     amroutine.amsearcharray = true;
     amroutine.amstorage = false;
     amroutine.amclusterable = false;
@@ -846,6 +850,20 @@ const _DEFAULT_SCAN_BATCH_SIZE: usize = 64; // Picked arbitrarily for now
 
 #[self_referencing]
 struct ScanOpaque {
+    // Keep a universe for usage in amgetbitmap
+    universe: RoaringBitmap,
+    // Some useful state for scanning produced during universe contruction
+    document_keys: Vec<String>,
+    query_terms: Option<Vec<milli::LocatedQueryTerm>>,
+    used_negative_operator: bool,
+    // Batch up bucketed search results in a Vec
+    search_bucket: Vec<milli::DocumentId>,
+    // Use as a global id to support forward/backward scans across pages
+    search_idx: usize,
+    // Storage for ammarkpos and amrestrpos
+    marked_bucket: Vec<milli::DocumentId>,
+    marked_idx: Option<usize>,
+    // Search context bootstrapping
     milli_index: milli::Index,
     #[borrows(milli_index)]
     #[covariant]
@@ -853,15 +871,6 @@ struct ScanOpaque {
     #[borrows(milli_index, lmdb_rtxn)]
     #[covariant]
     milli_context: milli::SearchContext<'this>,
-    // Keep a universe for usage in amgetbitmap
-    universe: RoaringBitmap,
-    // Batch up paginated search results in a Vec
-    search_page: Vec<milli::DocumentId>,
-    // Use as a global id to support forward/backward scans across pages
-    search_idx: usize,
-    // Storage for ammarkpos and amrestrpos
-    marked_page: Vec<milli::DocumentId>,
-    marked_idx: Option<usize>,
 }
 
 #[pg_guard]
@@ -893,10 +902,14 @@ pub extern "C" fn ambeginscan(
         milli_context_builder: |milli_index, lmdb_rtxn| {
             milli::SearchContext::new(milli_index, lmdb_rtxn).unwrap_or_report()
         },
+        // Empty universe, to be filled by amrescan
         universe: RoaringBitmap::new(),
-        search_page: Vec::default(),
+        document_keys: Vec::new(),
+        query_terms: None,
+        used_negative_operator: false,
+        search_bucket: Vec::default(),
         search_idx: 0,
-        marked_page: Vec::default(),
+        marked_bucket: Vec::default(),
         marked_idx: None,
     };
     // Load opaque into the scan description, free during amendscan
@@ -946,90 +959,52 @@ pub extern "C" fn amrescan(
     let natts = desc.natts as usize;
     let attrs = unsafe { desc.attrs.as_slice(natts) };
 
-    if !keys.is_null() || !orderbys.is_null() {
-        // Need to restart scan with new values; limit universe and apply settings
-        let keys = if keys.is_null() {
-            &[]
-        } else {
-            unsafe { slice::from_raw_parts(keys, nkeys as usize) }
-        };
-        let orderbys = if orderbys.is_null() {
-            &[]
-        } else {
-            unsafe { slice::from_raw_parts(orderbys, norderbys as usize) }
-        };
-        info!("{keys:?},{orderbys:?}");
+    // Need to restart scan with new values; limit universe and apply settings
+    let keys = if keys.is_null() {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(keys, nkeys as usize) }
+    };
+    let orderbys = if orderbys.is_null() {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(orderbys, norderbys as usize) }
+    };
+    info!("{keys:?},{orderbys:?}");
 
-        // Gather queries on columns
-        let queries: Vec<(PgmumboQuery, HashSet<&str>)> = keys
-            .iter()
-            .chain(orderbys)
-            .map(|scan_key| {
-                let att_idx = (scan_key.sk_attno - 1) as usize;
-                let att_name = unsafe { CStr::from_ptr(attrs[att_idx].attname.data.as_ptr()) }
-                    .to_str()
-                    .unwrap_or_report();
-                let argument = unsafe {
-                    PgmumboQuery::from_datum(scan_key.sk_argument, scan_key.sk_argument.is_null())
-                }
-                .unwrap();
-                (argument, att_name)
-            })
-            .chunk_by(|x| x.0.clone())
-            .into_iter()
-            .map(|(k, v)| (k, v.map(|(_, v)| v).collect::<HashSet<&str>>()))
-            .collect();
-        info!("{queries:?}");
-
-        opaque.with_mut(|opaque| {
-            let mut tokbuilder = milli::tokenizer::TokenizerBuilder::new();
-            let rtxn = opaque.lmdb_rtxn;
-            let ctx = opaque.milli_context;
-
-            let stop_words = ctx.index.stop_words(rtxn).unwrap_or_report();
-            if let Some(ref stop_words) = stop_words {
-                tokbuilder.stop_words(stop_words);
+    // Gather queries on columns
+    let mut queries: Vec<(PgmumboQuery, HashSet<&str>)> = keys
+        .iter()
+        .chain(orderbys)
+        .map(|scan_key| {
+            let att_idx = (scan_key.sk_attno - 1) as usize;
+            let att_name = unsafe { CStr::from_ptr(attrs[att_idx].attname.data.as_ptr()) }
+                .to_str()
+                .unwrap_or_report();
+            let argument = unsafe {
+                PgmumboQuery::from_datum(scan_key.sk_argument, scan_key.sk_argument.is_null())
             }
-
-            let separators = ctx.index.allowed_separators(rtxn).unwrap_or_report();
-            let separators: Option<Vec<_>> = separators
-                .as_ref()
-                .map(|x| x.iter().map(String::as_str).collect());
-            if let Some(ref separators) = separators {
-                tokbuilder.separators(separators);
-            }
-
-            let dictionary = ctx.index.dictionary(rtxn).unwrap_or_report();
-            let dictionary: Option<Vec<_>> = dictionary
-                .as_ref()
-                .map(|x| x.iter().map(String::as_str).collect());
-            if let Some(ref dictionary) = dictionary {
-                tokbuilder.words_dict(dictionary);
-            }
-
-            let script_lang_map = ctx.index.script_language(rtxn).unwrap_or_report();
-            if !script_lang_map.is_empty() {
-                tokbuilder.allow_list(&script_lang_map);
-            }
-
-            let tokenizer = tokbuilder.build();
-            let _tokens = tokenizer.tokenize("TODO query");
-        });
+            .unwrap();
+            (argument, att_name)
+        })
+        .chunk_by(|x| x.0.clone())
+        .into_iter()
+        .map(|(k, v)| (k, v.map(|(_, v)| v).collect::<HashSet<&str>>()))
+        .collect();
+    // Produce the final PgmumboQuery
+    if queries.len() != 1 {
+        error!("pgmumbo does not support dissimilar queries on multiple columns")
     }
+    let (query, document_keys) = queries.pop().unwrap();
+    let document_keys: Vec<String> = document_keys.into_iter().map(|x| x.to_string()).collect();
 
     // execute_search allows as to both paginate forwards and backwards on results in the same rtxn
     // so it enables us to support both linear scans and bitmaps
     //
     // if ambitmapscan, then we translate the universe into TIDBitmap
     // if amgettuple, then we increase or decrease the search_idx, and grab a new cached page if needed
-
-    opaque.with_mut(|opaque| {
-        *opaque.universe = opaque
-            .milli_context
-            .index
-            .documents_ids(opaque.milli_context.txn)
-            .unwrap_or_report();
-    });
+    let heads = opaque.into_heads();
+    heads.
 }
 
 #[pg_guard]
