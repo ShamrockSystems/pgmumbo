@@ -39,25 +39,29 @@ thread_local! {
     static EXISTING_OBJECT_ACCESS_HOOK: object_access_hook_type = None;
 }
 
-#[derive(Clone)]
 struct Cache {
     milli_index: milli::Index,
 }
 
-impl From<&PgRelation> for &Cache {
-    fn from(index_relation: &PgRelation) -> Self {
+impl From<&mut PgRelation> for &Cache {
+    fn from(index_relation: &mut PgRelation) -> Self {
         if index_relation.rd_amcache.is_null() {
             info!("{PROGRAM_NAME}: opening up a new index");
             // Open up an index
             let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
             let mut lmdb_options = heed::EnvOpenOptions::new();
             lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE); // TODO discover map size if possible
-            // Probably would be better to find a better memory context and leak into it
-            let cache: *mut Cache = unsafe { PgMemoryContexts::CacheMemoryContext.palloc_struct() };
-            unsafe { &mut *cache }.milli_index =
-                milli::Index::new(lmdb_options, index_path).unwrap_or_report();
+            let cache = Cache {
+                milli_index: milli::Index::new(lmdb_options, index_path).unwrap_or_report(),
+            };
+            info!("{PROGRAM_NAME}: store cache");
+            unsafe { *index_relation.as_ptr() }.rd_amcache = PgMemoryContexts::CacheMemoryContext
+                .leak_and_drop_on_delete(cache)
+                as *mut ffi::c_void;
         }
-        unsafe { &*(index_relation.rd_amcache as *mut Cache) }
+        info!("{PROGRAM_NAME}: ret cache");
+        let loaded = unsafe { &*(index_relation.rd_amcache as *mut Cache) };
+        loaded
     }
 }
 
@@ -245,7 +249,7 @@ pub extern "C" fn ambuild(
     info!("{PROGRAM_NAME} ambuild");
 
     let heap_relation = unsafe { PgRelation::from_pg(heap_relation) };
-    let index_relation = unsafe { PgRelation::from_pg(index_relation) };
+    let mut index_relation = unsafe { PgRelation::from_pg(index_relation) };
 
     assert!(index_relation.is_index());
 
@@ -261,7 +265,7 @@ pub extern "C" fn ambuild(
     }
     fs::create_dir_all(&index_path).unwrap_or_report();
 
-    let cache: &Cache = (&index_relation).into();
+    let cache: &Cache = (&mut index_relation).into();
 
     let mut build_state = BuildState {
         owned_context: PgMemoryContexts::new(PROGRAM_NAME),
@@ -499,9 +503,9 @@ pub extern "C" fn aminsert(
     let mut insert_context = PgMemoryContexts::new(PROGRAM_NAME);
     let mut old_owned_context = unsafe { insert_context.set_as_current() };
 
-    let index_relation = unsafe { PgRelation::from_pg(index_relation) };
+    let mut index_relation = unsafe { PgRelation::from_pg(index_relation) };
     let options: Options = index_relation.rd_options.try_into().unwrap_or_report();
-    let cache: &Cache = (&index_relation).into();
+    let cache: &Cache = (&mut index_relation).into();
 
     let desc = unsafe { index_relation.rd_att.as_ref() }.unwrap();
     let natts = desc.natts as usize;
@@ -549,16 +553,15 @@ pub extern "C" fn ambulkdelete(
     callback_state: *mut raw::c_void,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
     let callback = callback.unwrap();
-    let index_relation = unsafe { PgRelation::from_pg((*info).index) };
+    let mut index_relation = unsafe { PgRelation::from_pg((*info).index) };
     let options: Options = index_relation.rd_options.try_into().unwrap_or_report();
-    let cache: &Cache = (&index_relation).into();
+    let cache: &Cache = (&mut index_relation).into();
 
     let stats = if stats.is_null() {
         unsafe { PgBox::<pg_sys::IndexBulkDeleteResult>::alloc0() }.into_pg_boxed()
     } else {
         unsafe { PgBox::from_pg(stats) }
     };
-
 
     // Gather external document IDs for deletion
     let mut to_delete: Vec<String> = Vec::new();
@@ -898,8 +901,9 @@ pub extern "C" fn ambeginscan(
             norderbys,
         ))
     };
-    let index_relation = unsafe { PgRelation::from_pg(index_relation) };
-    let cache: &Cache = (&index_relation).into();
+    let mut index_relation = unsafe { PgRelation::from_pg(index_relation) };
+    let cache: &Cache = (&mut index_relation).into();
+    info!("{:?}", cache.milli_index.path());
 
     // Initialize opaque
     let opaque_builder = ScanOpaqueBuilder {
