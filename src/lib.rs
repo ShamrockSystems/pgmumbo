@@ -2,15 +2,12 @@
 
 use std::{
     borrow::BorrowMut,
-    cell::OnceCell,
     collections::{BTreeMap, BTreeSet, HashSet},
     ffi::{self, CStr},
     fs,
     io::{self, Cursor},
-    iter::{self},
-    mem,
+    iter,
     num::{NonZeroU32, ParseIntError},
-    ops::DerefMut,
     os::raw,
     path::{Path, PathBuf},
     ptr, slice,
@@ -39,30 +36,42 @@ thread_local! {
     static EXISTING_OBJECT_ACCESS_HOOK: object_access_hook_type = None;
 }
 
-struct Cache {
-    milli_index: milli::Index,
-}
+// struct Cache {
+//     milli_index: milli::Index,
+// }
 
-impl From<&mut PgRelation> for &Cache {
-    fn from(index_relation: &mut PgRelation) -> Self {
-        if index_relation.rd_amcache.is_null() {
-            info!("{PROGRAM_NAME}: opening up a new index");
-            // Open up an index
-            let index_path = lmdb_location(index_relation.rd_node).unwrap_or_report();
-            let mut lmdb_options = heed::EnvOpenOptions::new();
-            lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE); // TODO discover map size if possible
-            let cache = Cache {
-                milli_index: milli::Index::new(lmdb_options, index_path).unwrap_or_report(),
-            };
-            info!("{PROGRAM_NAME}: store cache");
-            unsafe { *index_relation.as_ptr() }.rd_amcache = PgMemoryContexts::CacheMemoryContext
-                .leak_and_drop_on_delete(cache)
-                as *mut ffi::c_void;
-        }
-        info!("{PROGRAM_NAME}: ret cache");
-        let loaded = unsafe { &*(index_relation.rd_amcache as *mut Cache) };
-        loaded
-    }
+// // Very segfaulty rn.. wait till later
+// macro_rules! get_cache {
+//     ($index_relation:expr) => {{
+//         if unsafe { *$index_relation }.rd_amcache.is_null() {
+//             info!("{PROGRAM_NAME}: opening up a new index");
+//             // Open up an index
+//             let index_path = lmdb_location(unsafe { *$index_relation }.rd_node).unwrap_or_report();
+//             let mut lmdb_options = heed::EnvOpenOptions::new();
+//             lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE); // TODO discover map size if possible
+//             let cache = Cache {
+//                 milli_index: milli::Index::new(lmdb_options, index_path).unwrap_or_report(),
+//             };
+//             // let cache_ptr = PgMemoryContexts::For(unsafe { *$index_relation }.rd_indexcxt)
+//             // .f_and_drop_on_delete(cache) as *mut ffi::c_void;
+//             let cache_ptr = Box::leak(Box::new(cache)) as *mut Cache as *mut ffi::c_void;
+//             unsafe { (*$index_relation).rd_amcache = cache_ptr };
+//             info!(
+//                 "{PROGRAM_NAME}: stored: {:?}",
+//                 unsafe { *$index_relation }.rd_amcache
+//             );
+//         }
+//         unsafe { PgBox::from_pg((*$index_relation).rd_amcache as *mut Cache) }
+//     }};
+// }
+
+macro_rules! get_index {
+    ($index_relation:expr) => {{
+        let index_path = lmdb_location($index_relation.rd_node).unwrap_or_report();
+        let mut lmdb_options = heed::EnvOpenOptions::new();
+        lmdb_options.map_size(INITIAL_LMDB_MMAP_SIZE);
+        milli::Index::new(lmdb_options, index_path).unwrap_or_report()
+    }};
 }
 
 #[allow(non_snake_case)]
@@ -247,9 +256,8 @@ pub extern "C" fn ambuild(
     index_info: *mut pg_sys::IndexInfo,
 ) -> *mut pg_sys::IndexBuildResult {
     info!("{PROGRAM_NAME} ambuild");
-
     let heap_relation = unsafe { PgRelation::from_pg(heap_relation) };
-    let mut index_relation = unsafe { PgRelation::from_pg(index_relation) };
+    let index_relation = unsafe { PgRelation::from_pg(index_relation) };
 
     assert!(index_relation.is_index());
 
@@ -265,7 +273,7 @@ pub extern "C" fn ambuild(
     }
     fs::create_dir_all(&index_path).unwrap_or_report();
 
-    let cache: &Cache = (&mut index_relation).into();
+    let milli_index = get_index!(index_relation);
 
     let mut build_state = BuildState {
         owned_context: PgMemoryContexts::new(PROGRAM_NAME),
@@ -283,12 +291,12 @@ pub extern "C" fn ambuild(
     }
 
     let documents = build_state.batch_builder.into_inner().unwrap_or_report();
-    let mut wtxn = cache.milli_index.write_txn().unwrap_or_report();
+    let mut wtxn = milli_index.write_txn().unwrap_or_report();
 
     let milli_idx_config: milli::update::IndexerConfig = (&options).into();
     let milli_idx_doc_config: milli::update::IndexDocumentsConfig = (&options).into();
     let mut milli_settings =
-        milli::update::Settings::new(&mut wtxn, &cache.milli_index, &milli_idx_config);
+        milli::update::Settings::new(&mut wtxn, &milli_index, &milli_idx_config);
     milli_settings.set_primary_key(TID_PRIMARY_KEY.to_string());
     macro_rules! set_ms_option {
         ($option:ident, $method:ident) => {
@@ -322,7 +330,7 @@ pub extern "C" fn ambuild(
 
     let mut indexer = milli::update::IndexDocuments::new(
         &mut wtxn,
-        &cache.milli_index,
+        &milli_index,
         &milli_idx_config,
         milli_idx_doc_config,
         |_| {},
@@ -503,9 +511,8 @@ pub extern "C" fn aminsert(
     let mut insert_context = PgMemoryContexts::new(PROGRAM_NAME);
     let mut old_owned_context = unsafe { insert_context.set_as_current() };
 
-    let mut index_relation = unsafe { PgRelation::from_pg(index_relation) };
+    let index_relation = unsafe { PgRelation::from_pg(index_relation) };
     let options: Options = index_relation.rd_options.try_into().unwrap_or_report();
-    let cache: &Cache = (&mut index_relation).into();
 
     let desc = unsafe { index_relation.rd_att.as_ref() }.unwrap();
     let natts = desc.natts as usize;
@@ -518,13 +525,15 @@ pub extern "C" fn aminsert(
     info!("{PROGRAM_NAME} aminsert: {document:?}");
     let document_reader = documents_batch_reader_from_objects(iter::once(document));
 
+    let milli_index = get_index!(index_relation);
+
     // Insert the document into the index
-    let mut wtxn = cache.milli_index.write_txn().unwrap_or_report();
+    let mut wtxn = milli_index.write_txn().unwrap_or_report();
     let milli_idx_config: milli::update::IndexerConfig = (&options).into();
     let milli_idx_doc_config: milli::update::IndexDocumentsConfig = (&options).into();
     let indexer = milli::update::IndexDocuments::new(
         &mut wtxn,
-        &cache.milli_index,
+        &milli_index,
         &milli_idx_config,
         milli_idx_doc_config,
         |_| {},
@@ -553,9 +562,9 @@ pub extern "C" fn ambulkdelete(
     callback_state: *mut raw::c_void,
 ) -> *mut pg_sys::IndexBulkDeleteResult {
     let callback = callback.unwrap();
-    let mut index_relation = unsafe { PgRelation::from_pg((*info).index) };
+    let index_relation = unsafe { (*info).index };
+    let index_relation = unsafe { PgRelation::from_pg(index_relation) };
     let options: Options = index_relation.rd_options.try_into().unwrap_or_report();
-    let cache: &Cache = (&mut index_relation).into();
 
     let stats = if stats.is_null() {
         unsafe { PgBox::<pg_sys::IndexBulkDeleteResult>::alloc0() }.into_pg_boxed()
@@ -563,13 +572,15 @@ pub extern "C" fn ambulkdelete(
         unsafe { PgBox::from_pg(stats) }
     };
 
+    let milli_index = get_index!(index_relation);
+
     // Gather external document IDs for deletion
     let mut to_delete: Vec<String> = Vec::new();
-    let mut wtxn = cache.milli_index.write_txn().unwrap_or_report();
-    let milli_index_fields = cache.milli_index.fields_ids_map(&wtxn).unwrap_or_report();
+    let mut wtxn = milli_index.write_txn().unwrap_or_report();
+    let milli_index_fields = milli_index.fields_ids_map(&wtxn).unwrap_or_report();
     let milli_primary_key =
         milli::documents::PrimaryKey::new(TID_PRIMARY_KEY, &milli_index_fields).unwrap();
-    for document in cache.milli_index.all_documents(&wtxn).unwrap_or_report() {
+    for document in milli_index.all_documents(&wtxn).unwrap_or_report() {
         let (_, kv_reader) = document.unwrap_or_report();
         let pk_value = milli_primary_key
             .document_id(&kv_reader, &milli_index_fields)
@@ -590,7 +601,7 @@ pub extern "C" fn ambulkdelete(
     let milli_idx_doc_config: milli::update::IndexDocumentsConfig = (&options).into();
     let indexer = milli::update::IndexDocuments::new(
         &mut wtxn,
-        &cache.milli_index,
+        &milli_index,
         &milli_idx_config,
         milli_idx_doc_config,
         |_| (),
@@ -901,13 +912,11 @@ pub extern "C" fn ambeginscan(
             norderbys,
         ))
     };
-    let mut index_relation = unsafe { PgRelation::from_pg(index_relation) };
-    let cache: &Cache = (&mut index_relation).into();
-    info!("{:?}", cache.milli_index.path());
+    let index_relation = unsafe { PgRelation::from_pg(index_relation) };
 
     // Initialize opaque
     let opaque_builder = ScanOpaqueBuilder {
-        milli_index: cache.milli_index.clone(),
+        milli_index: get_index!(index_relation),
         // Open an LMDB read transaction
         lmdb_rtxn_builder: |milli_index| milli_index.read_txn().unwrap_or_report(),
         // Open up a search context
