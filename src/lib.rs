@@ -230,7 +230,7 @@ fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine>
     amroutine.amadjustmembers = None;
     amroutine.ambeginscan = Some(ambeginscan);
     amroutine.amrescan = Some(amrescan);
-    amroutine.amgettuple = None; //Some(amgettuple);
+    amroutine.amgettuple = Some(amgettuple);
     amroutine.amgetbitmap = Some(amgetbitmap);
     amroutine.amendscan = Some(amendscan);
     amroutine.ammarkpos = None;
@@ -1132,7 +1132,7 @@ pub extern "C" fn amrescan(
                 QueryGraph::from_query(opaque.milli_context, &query_terms).unwrap_or_report();
             let ranking_rules = get_ranking_rules_for_query_graph_search(
                 opaque.milli_context,
-                &None,
+                &None, // TODO setup AscDesc
                 milli::GeoSortStrategy::default(),
                 query.terms_matching_strategy,
             )
@@ -1149,6 +1149,17 @@ pub extern "C" fn amrescan(
             *opaque.ranking_rules = ranking_rules
                 .into_iter()
                 .map(MilliRankingRule::Graph)
+                .collect();
+        } else {
+            let ranking_rules = get_ranking_rules_for_placeholder_search(
+                opaque.milli_context,
+                &None,
+                milli::GeoSortStrategy::default(),
+            )
+            .unwrap_or_report();
+            *opaque.ranking_rules = ranking_rules
+                .into_iter()
+                .map(MilliRankingRule::Placeholder)
                 .collect();
         }
     });
