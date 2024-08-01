@@ -17,7 +17,10 @@ use std::{
 use itertools::{izip, Itertools};
 use milli::{
     documents::{documents_batch_reader_from_objects, DocumentsBatchBuilder, DocumentsBatchReader},
-    heed,
+    get_ranking_rules_for_placeholder_search, get_ranking_rules_for_query_graph_search, heed,
+    query_graph::QueryGraph,
+    ranking_rules::{PlaceholderQuery, RankingRuleQueryTrait},
+    resolve_query_terms, resolve_universe,
 };
 use pg_sys::{object_access_hook_type, panic::ErrorReportable, ObjectAccessDrop};
 use pgrx::{datum, memcx, prelude::*, vardata_4b, varsize_4b, PgMemoryContexts, PgRelation};
@@ -873,14 +876,20 @@ extension_sql!(
 
 const _DEFAULT_SCAN_BATCH_SIZE: usize = 64; // Picked arbitrarily for now
 
+#[derive(Clone)]
+enum MilliQuery {
+    Graph(milli::query_graph::QueryGraph),
+    Placeholder(milli::ranking_rules::PlaceholderQuery),
+}
+
+impl RankingRuleQueryTrait for MilliQuery {}
+
 #[self_referencing]
 struct ScanOpaque {
     // Keep a universe for usage in amgetbitmap
     universe: RoaringBitmap,
     // Some useful state for scanning produced during universe contruction
-    document_keys: Vec<String>,
-    query_terms: Option<Vec<milli::LocatedQueryTerm>>,
-    used_negative_operator: bool,
+    milli_query: MilliQuery,
     // Batch up bucketed search results in a Vec
     search_bucket: Vec<milli::DocumentId>,
     // Use as a global id to support forward/backward scans across pages
@@ -925,9 +934,8 @@ pub extern "C" fn ambeginscan(
         },
         // Empty universe, to be filled by amrescan
         universe: RoaringBitmap::new(),
-        document_keys: Vec::new(),
-        query_terms: None,
-        used_negative_operator: false,
+        milli_query: MilliQuery::Placeholder(PlaceholderQuery),
+        // ranking_rules: Vec::default(),
         search_bucket: Vec::default(),
         search_idx: 0,
         marked_bucket: Vec::default(),
@@ -1019,12 +1027,41 @@ pub extern "C" fn amrescan(
     let (query, document_keys) = queries.pop().unwrap();
     let document_keys: Vec<String> = document_keys.into_iter().map(|x| x.to_string()).collect();
 
-    // execute_search allows as to both paginate forwards and backwards on results in the same rtxn
-    // so it enables us to support both linear scans and bitmaps
-    //
-    // if ambitmapscan, then we translate the universe into TIDBitmap
-    // if amgettuple, then we increase or decrease the search_idx, and grab a new cached page if needed
-    // let heads = opaque.into_heads();
+    opaque.with_mut(|opaque| {
+        *opaque.universe = opaque.milli_index.documents_ids(opaque.lmdb_rtxn).unwrap();
+        opaque
+            .milli_context
+            .attributes_to_search_on(&document_keys)
+            .unwrap();
+        let (query_terms, _) = resolve_query_terms(
+            opaque.milli_context,
+            query.query.as_deref(),
+            opaque.universe,
+            None,
+            None,
+        )
+        .unwrap();
+        if let Some(query_terms) = query_terms {
+            let (graph, _) =
+                QueryGraph::from_query(opaque.milli_context, &query_terms).unwrap_or_report();
+            // let ranking_rules = get_ranking_rules_for_query_graph_search(
+            //     opaque.milli_context,
+            //     &None,
+            //     milli::GeoSortStrategy::default(),
+            //     query.terms_matching_strategy,
+            // );
+            *opaque.universe &= resolve_universe(
+                opaque.milli_context,
+                opaque.universe,
+                &graph,
+                query.terms_matching_strategy,
+                &mut milli::DefaultSearchLogger,
+            )
+            .unwrap();
+            *opaque.milli_query = MilliQuery::Graph(graph);
+            // *opaque.ranking_rules = ranking_rules;
+        }
+    });
 }
 
 #[pg_guard]
