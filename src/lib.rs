@@ -19,7 +19,9 @@ use milli::{
     documents::{documents_batch_reader_from_objects, DocumentsBatchBuilder, DocumentsBatchReader},
     get_ranking_rules_for_placeholder_search, get_ranking_rules_for_query_graph_search, heed,
     query_graph::QueryGraph,
-    ranking_rules::{PlaceholderQuery, RankingRule, RankingRuleOutput, RankingRuleQueryTrait},
+    ranking_rules::{
+        BoxRankingRule, PlaceholderQuery, RankingRule, RankingRuleOutput, RankingRuleQueryTrait,
+    },
     resolve_query_terms, resolve_universe, DefaultSearchLogger,
 };
 use pg_sys::{object_access_hook_type, panic::ErrorReportable, ObjectAccessDrop};
@@ -200,10 +202,10 @@ fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine>
     amroutine.amstrategies = 1; // Enumerated in operator classes
     amroutine.amsupport = 0;
     amroutine.amoptsprocnum = 0;
-    amroutine.amcanorder = false;
-    amroutine.amcanorderbyop = true;
-    amroutine.amcanbackward = false;
-    amroutine.amcanunique = false;
+    amroutine.amcanorder = false; // The index cannot return TIDs in a B-tree compatible manner
+    amroutine.amcanorderbyop = true; // Support ORDER BY clause on supported operators
+    amroutine.amcanbackward = false; // It's not guaranteed the total number of hits for a given query is known
+    amroutine.amcanunique = false; // It's not particularly useful to use milli to perform uniqueness checks on columns
     amroutine.amcanmulticol = true; // Support multiple index columns
     amroutine.amoptionalkey = true; // Support index scans omitting the first index column
     amroutine.amsearcharray = true;
@@ -229,7 +231,7 @@ fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine>
     amroutine.amvalidate = Some(amvalidate);
     amroutine.amadjustmembers = None;
     amroutine.ambeginscan = Some(ambeginscan);
-    amroutine.amrescan = Some(amrescan);
+    amroutine.amrescan = None; // Some(amrescan);
     amroutine.amgettuple = Some(amgettuple);
     amroutine.amgetbitmap = Some(amgetbitmap);
     amroutine.amendscan = Some(amendscan);
@@ -869,102 +871,20 @@ extension_sql!(
     "CREATE OPERATOR CLASS pgmumbo_ops_pgmumboquery
         DEFAULT FOR TYPE text
         USING pgmumbo AS
-            OPERATOR 1 @?(text, pgmumboquery);",
+            OPERATOR 1 @?(text, pgmumboquery) FOR ORDER BY pgmumbo;",
     name = "operator_class_pgmumboquery",
     requires = ["index_access_method", "operator_pgmumboquery", PgmumboQuery],
 );
 
-const _DEFAULT_SCAN_BATCH_SIZE: usize = 64; // Picked arbitrarily for now
-
-#[derive(Clone)]
-enum MilliQuery {
-    Graph(milli::query_graph::QueryGraph),
-    Placeholder(milli::ranking_rules::PlaceholderQuery),
-}
-impl RankingRuleQueryTrait for MilliQuery {}
-
-enum MilliRankingRule<'ctx> {
-    Graph(Box<dyn RankingRule<'ctx, QueryGraph> + 'ctx>),
-    Placeholder(Box<dyn RankingRule<'ctx, PlaceholderQuery> + 'ctx>),
-}
-// Very hacky! TODO is there a less mediocre way to do this?
-impl<'ctx> RankingRule<'ctx, MilliQuery> for MilliRankingRule<'ctx> {
-    fn id(&self) -> String {
-        match self {
-            MilliRankingRule::Graph(rule) => rule.id(),
-            MilliRankingRule::Placeholder(rule) => rule.id(),
-        }
-    }
-
-    fn start_iteration(
-        &mut self,
-        ctx: &mut milli::SearchContext<'ctx>,
-        _logger: &mut dyn milli::SearchLogger<MilliQuery>,
-        universe: &RoaringBitmap,
-        query: &MilliQuery,
-    ) -> Result<(), milli::Error> {
-        // TODO fixup the logger eventually... we currently don't have the logger hooked up upstream anyway
-        match self {
-            MilliRankingRule::Graph(rule) => {
-                if let MilliQuery::Graph(query) = query {
-                    rule.start_iteration(ctx, &mut DefaultSearchLogger, universe, query)?;
-                } else {
-                    panic!();
-                }
-            }
-            MilliRankingRule::Placeholder(rule) => {
-                if let MilliQuery::Placeholder(query) = query {
-                    rule.start_iteration(ctx, &mut DefaultSearchLogger, universe, query)?;
-                } else {
-                    panic!();
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn next_bucket(
-        &mut self,
-        ctx: &mut milli::SearchContext<'ctx>,
-        _logger: &mut dyn milli::SearchLogger<MilliQuery>,
-        universe: &RoaringBitmap,
-    ) -> Result<Option<RankingRuleOutput<MilliQuery>>, milli::Error> {
-        // TODO fixup the logger eventually... we currently don't have the logger hooked up upstream anyway
-        match self {
-            MilliRankingRule::Graph(rule) => rule
-                .next_bucket(ctx, &mut DefaultSearchLogger, universe)
-                .map(|bucket| {
-                    bucket.map(|output| RankingRuleOutput {
-                        query: MilliQuery::Graph(output.query),
-                        candidates: output.candidates,
-                        score: output.score,
-                    })
-                }),
-            MilliRankingRule::Placeholder(rule) => rule
-                .next_bucket(ctx, &mut DefaultSearchLogger, universe)
-                .map(|bucket| {
-                    bucket.map(|output| RankingRuleOutput {
-                        query: MilliQuery::Placeholder(output.query),
-                        candidates: output.candidates,
-                        score: output.score,
-                    })
-                }),
-        }
-    }
-
-    fn end_iteration(
-        &mut self,
-        ctx: &mut milli::SearchContext<'ctx>,
-        _logger: &mut dyn milli::SearchLogger<MilliQuery>,
-    ) {
-        // TODO fixup the logger eventually... we currently don't have the logger hooked up upstream anyway
-        match self {
-            MilliRankingRule::Graph(rule) => rule.end_iteration(ctx, &mut DefaultSearchLogger),
-            MilliRankingRule::Placeholder(rule) => {
-                rule.end_iteration(ctx, &mut DefaultSearchLogger)
-            }
-        }
-    }
+enum MilliQuery<'ctx> {
+    Graph(
+        milli::query_graph::QueryGraph,
+        Vec<BoxRankingRule<'ctx, QueryGraph>>,
+    ),
+    Placeholder(
+        milli::ranking_rules::PlaceholderQuery,
+        Vec<BoxRankingRule<'ctx, PlaceholderQuery>>,
+    ),
 }
 
 #[self_referencing]
@@ -974,24 +894,28 @@ struct ScanOpaque {
     #[borrows(milli_index)]
     #[covariant]
     lmdb_rtxn: heed::RoTxn<'this>,
+    // Search context
     #[borrows(milli_index, lmdb_rtxn)]
-    #[covariant]
+    #[not_covariant]
     milli_context: milli::SearchContext<'this>,
     // Keep a universe for usage in amgetbitmap
     universe: RoaringBitmap,
     // Some useful state for scanning produced during universe contruction
-    milli_query: MilliQuery,
-    #[borrows(milli_index, lmdb_rtxn)]
+    #[borrows(lmdb_rtxn)]
     #[not_covariant]
-    ranking_rules: Vec<MilliRankingRule<'this>>,
-    // Batch up bucketed search results in a Vec
-    search_bucket: Vec<milli::DocumentId>,
-    // Use as a global id to support forward/backward scans across pages
-    search_idx: usize,
+    milli_query: MilliQuery<'this>,
+    terms_matching_strategy: milli::TermsMatchingStrategy,
+    scoring_strategy: milli::score_details::ScoringStrategy,
+    // Batch up stashed search results in a Vec
+    batch_size: usize,
+    search_stash: Vec<milli::DocumentId>,
+    search_idx: Option<usize>,
     // Storage for ammarkpos and amrestrpos
-    marked_bucket: Vec<milli::DocumentId>,
+    marked_stash: Vec<milli::DocumentId>,
     marked_idx: Option<usize>,
 }
+
+const DEFAULT_SCAN_BATCH_SIZE: usize = 64; // Picked arbitrarily for now
 
 #[pg_guard]
 pub extern "C" fn ambeginscan(
@@ -1020,11 +944,13 @@ pub extern "C" fn ambeginscan(
         },
         // Empty universe, to be filled by amrescan
         universe: RoaringBitmap::new(),
-        milli_query: MilliQuery::Placeholder(PlaceholderQuery),
-        ranking_rules_builder: |_, _| Vec::default(),
-        search_bucket: Vec::default(),
-        search_idx: 0,
-        marked_bucket: Vec::default(),
+        milli_query_builder: |_| MilliQuery::Placeholder(PlaceholderQuery, Vec::new()),
+        terms_matching_strategy: milli::TermsMatchingStrategy::default(),
+        scoring_strategy: milli::score_details::ScoringStrategy::default(),
+        batch_size: DEFAULT_SCAN_BATCH_SIZE,
+        search_stash: Vec::default(),
+        search_idx: None,
+        marked_stash: Vec::default(),
         marked_idx: None,
     };
     // Load opaque into the scan description, free during amendscan
@@ -1145,11 +1071,7 @@ pub extern "C" fn amrescan(
                 &mut milli::DefaultSearchLogger,
             )
             .unwrap_or_report();
-            *opaque.milli_query = MilliQuery::Graph(graph);
-            *opaque.ranking_rules = ranking_rules
-                .into_iter()
-                .map(MilliRankingRule::Graph)
-                .collect();
+            *opaque.milli_query = MilliQuery::Graph(graph, ranking_rules);
         } else {
             let ranking_rules = get_ranking_rules_for_placeholder_search(
                 opaque.milli_context,
@@ -1157,11 +1079,10 @@ pub extern "C" fn amrescan(
                 milli::GeoSortStrategy::default(),
             )
             .unwrap_or_report();
-            *opaque.ranking_rules = ranking_rules
-                .into_iter()
-                .map(MilliRankingRule::Placeholder)
-                .collect();
+            *opaque.milli_query = MilliQuery::Placeholder(PlaceholderQuery, ranking_rules);
         }
+        *opaque.terms_matching_strategy = query.terms_matching_strategy;
+        *opaque.scoring_strategy = query.scoring_strategy;
     });
 }
 
@@ -1171,17 +1092,91 @@ pub extern "C" fn amgettuple(
     direction: pg_sys::ScanDirection::Type,
 ) -> bool {
     info!("{PROGRAM_NAME} amgettuple");
-    let scan = unsafe { PgBox::from_pg(scan) };
-    let _opaque = unsafe { PgBox::from_pg(scan.opaque as *mut ScanOpaque) };
+    let mut scan = unsafe { PgBox::from_pg(scan) };
+    let mut opaque = unsafe { PgBox::from_pg(scan.opaque as *mut ScanOpaque) };
 
-    match direction {
-        pg_sys::ScanDirection::ForwardScanDirection => {}
-        pg_sys::ScanDirection::BackwardScanDirection => {}
-        pg_sys::ScanDirection::NoMovementScanDirection => {}
-        _ => error!("Unsupported scan direction: {direction}"),
-    };
+    let documents_remain = false;
 
-    false
+    // TODO: check specifics of lifetime aliasing issue
+
+    // opaque.with_mut(|opaque| {
+    //     // Set up TID lookup tools
+    //     let milli_index_fields = opaque
+    //         .milli_index
+    //         .fields_ids_map(opaque.lmdb_rtxn)
+    //         .unwrap_or_report();
+    //     let milli_primary_key =
+    //         milli::documents::PrimaryKey::new(TID_PRIMARY_KEY, &milli_index_fields).unwrap();
+    //     macro_rules! get_tid {
+    //         ($document_id:expr) => {{
+    //             let (_, document) = opaque
+    //                 .milli_index
+    //                 .documents(opaque.lmdb_rtxn, iter::once($document_id))
+    //                 .unwrap()
+    //                 .into_iter()
+    //                 .next()
+    //                 .unwrap();
+    //             let pk_value = milli_primary_key
+    //                 .document_id(&document, &milli_index_fields)
+    //                 .unwrap_or_report()
+    //                 .map_err(|_| todo!())
+    //                 .unwrap();
+    //             name_to_tid(&pk_value).unwrap_or_report()
+    //         }};
+    //     }
+
+    //     // Check if we have a stash already...
+    //     if let Some(search_idx) = opaque.search_idx {
+    //         match direction {
+    //             pg_sys::ScanDirection::ForwardScanDirection => {}
+    //             pg_sys::ScanDirection::NoMovementScanDirection => {
+    //                 // We know that the stash is already initialized, so let's just grab it
+    //                 let stash_idx = *search_idx % *opaque.batch_size;
+    //                 let document_id = opaque.search_stash[stash_idx];
+    //                 scan.xs_heaptid = get_tid!(document_id);
+    //             }
+    //             _ => error!("Unsupported scan direction: {direction}"),
+    //         };
+    //     } else {
+    //         // if not, then we'll have to initialize the stash
+    //         let bucket_result = match opaque.milli_query {
+    //             MilliQuery::Graph(query, ranking_rules) => {
+    //                 milli::search::new::bucket_sort::bucket_sort(
+    //                     opaque.milli_context,
+    //                     ranking_rules,
+    //                     query,
+    //                     None,
+    //                     opaque.universe,
+    //                     0,
+    //                     0,
+    //                     *opaque.scoring_strategy,
+    //                     &mut DefaultSearchLogger,
+    //                     milli::TimeBudget::max(),
+    //                     None,
+    //                 )
+    //             }
+    //             MilliQuery::Placeholder(query, ranking_rules) => {
+    //                 milli::search::new::bucket_sort::bucket_sort(
+    //                     opaque.milli_context,
+    //                     ranking_rules,
+    //                     query,
+    //                     None,
+    //                     opaque.universe,
+    //                     0,
+    //                     0,
+    //                     *opaque.scoring_strategy,
+    //                     &mut DefaultSearchLogger,
+    //                     milli::TimeBudget::max(),
+    //                     None,
+    //                 )
+    //             }
+    //         }
+    //         .unwrap_or_report();
+    //         *opaque.search_stash = bucket_result.docids;
+    //     }
+    // });
+
+    documents_remain
 }
 
 #[pg_guard]
