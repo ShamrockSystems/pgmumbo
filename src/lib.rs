@@ -19,8 +19,8 @@ use milli::{
     documents::{documents_batch_reader_from_objects, DocumentsBatchBuilder, DocumentsBatchReader},
     get_ranking_rules_for_placeholder_search, get_ranking_rules_for_query_graph_search, heed,
     query_graph::QueryGraph,
-    ranking_rules::{PlaceholderQuery, RankingRuleQueryTrait},
-    resolve_query_terms, resolve_universe,
+    ranking_rules::{PlaceholderQuery, RankingRule, RankingRuleOutput, RankingRuleQueryTrait},
+    resolve_query_terms, resolve_universe, DefaultSearchLogger,
 };
 use pg_sys::{object_access_hook_type, panic::ErrorReportable, ObjectAccessDrop};
 use pgrx::{datum, memcx, prelude::*, vardata_4b, varsize_4b, PgMemoryContexts, PgRelation};
@@ -881,22 +881,94 @@ enum MilliQuery {
     Graph(milli::query_graph::QueryGraph),
     Placeholder(milli::ranking_rules::PlaceholderQuery),
 }
-
 impl RankingRuleQueryTrait for MilliQuery {}
+
+enum MilliRankingRule<'ctx> {
+    Graph(Box<dyn RankingRule<'ctx, QueryGraph> + 'ctx>),
+    Placeholder(Box<dyn RankingRule<'ctx, PlaceholderQuery> + 'ctx>),
+}
+// Very hacky! TODO is there a less mediocre way to do this?
+impl<'ctx> RankingRule<'ctx, MilliQuery> for MilliRankingRule<'ctx> {
+    fn id(&self) -> String {
+        match self {
+            MilliRankingRule::Graph(rule) => rule.id(),
+            MilliRankingRule::Placeholder(rule) => rule.id(),
+        }
+    }
+
+    fn start_iteration(
+        &mut self,
+        ctx: &mut milli::SearchContext<'ctx>,
+        _logger: &mut dyn milli::SearchLogger<MilliQuery>,
+        universe: &RoaringBitmap,
+        query: &MilliQuery,
+    ) -> Result<(), milli::Error> {
+        // TODO fixup the logger eventually... we currently don't have the logger hooked up upstream anyway
+        match self {
+            MilliRankingRule::Graph(rule) => {
+                if let MilliQuery::Graph(query) = query {
+                    rule.start_iteration(ctx, &mut DefaultSearchLogger, universe, query)?;
+                } else {
+                    panic!();
+                }
+            }
+            MilliRankingRule::Placeholder(rule) => {
+                if let MilliQuery::Placeholder(query) = query {
+                    rule.start_iteration(ctx, &mut DefaultSearchLogger, universe, query)?;
+                } else {
+                    panic!();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn next_bucket(
+        &mut self,
+        ctx: &mut milli::SearchContext<'ctx>,
+        _logger: &mut dyn milli::SearchLogger<MilliQuery>,
+        universe: &RoaringBitmap,
+    ) -> Result<Option<RankingRuleOutput<MilliQuery>>, milli::Error> {
+        // TODO fixup the logger eventually... we currently don't have the logger hooked up upstream anyway
+        match self {
+            MilliRankingRule::Graph(rule) => rule
+                .next_bucket(ctx, &mut DefaultSearchLogger, universe)
+                .map(|bucket| {
+                    bucket.map(|output| RankingRuleOutput {
+                        query: MilliQuery::Graph(output.query),
+                        candidates: output.candidates,
+                        score: output.score,
+                    })
+                }),
+            MilliRankingRule::Placeholder(rule) => rule
+                .next_bucket(ctx, &mut DefaultSearchLogger, universe)
+                .map(|bucket| {
+                    bucket.map(|output| RankingRuleOutput {
+                        query: MilliQuery::Placeholder(output.query),
+                        candidates: output.candidates,
+                        score: output.score,
+                    })
+                }),
+        }
+    }
+
+    fn end_iteration(
+        &mut self,
+        ctx: &mut milli::SearchContext<'ctx>,
+        _logger: &mut dyn milli::SearchLogger<MilliQuery>,
+    ) {
+        // TODO fixup the logger eventually... we currently don't have the logger hooked up upstream anyway
+        match self {
+            MilliRankingRule::Graph(rule) => rule.end_iteration(ctx, &mut DefaultSearchLogger),
+            MilliRankingRule::Placeholder(rule) => {
+                rule.end_iteration(ctx, &mut DefaultSearchLogger)
+            }
+        }
+    }
+}
 
 #[self_referencing]
 struct ScanOpaque {
-    // Keep a universe for usage in amgetbitmap
-    universe: RoaringBitmap,
-    // Some useful state for scanning produced during universe contruction
-    milli_query: MilliQuery,
-    // Batch up bucketed search results in a Vec
-    search_bucket: Vec<milli::DocumentId>,
-    // Use as a global id to support forward/backward scans across pages
-    search_idx: usize,
-    // Storage for ammarkpos and amrestrpos
-    marked_bucket: Vec<milli::DocumentId>,
-    marked_idx: Option<usize>,
     // Search context bootstrapping
     milli_index: milli::Index,
     #[borrows(milli_index)]
@@ -905,6 +977,20 @@ struct ScanOpaque {
     #[borrows(milli_index, lmdb_rtxn)]
     #[covariant]
     milli_context: milli::SearchContext<'this>,
+    // Keep a universe for usage in amgetbitmap
+    universe: RoaringBitmap,
+    // Some useful state for scanning produced during universe contruction
+    milli_query: MilliQuery,
+    #[borrows(milli_index, lmdb_rtxn)]
+    #[not_covariant]
+    ranking_rules: Vec<MilliRankingRule<'this>>,
+    // Batch up bucketed search results in a Vec
+    search_bucket: Vec<milli::DocumentId>,
+    // Use as a global id to support forward/backward scans across pages
+    search_idx: usize,
+    // Storage for ammarkpos and amrestrpos
+    marked_bucket: Vec<milli::DocumentId>,
+    marked_idx: Option<usize>,
 }
 
 #[pg_guard]
@@ -935,7 +1021,7 @@ pub extern "C" fn ambeginscan(
         // Empty universe, to be filled by amrescan
         universe: RoaringBitmap::new(),
         milli_query: MilliQuery::Placeholder(PlaceholderQuery),
-        // ranking_rules: Vec::default(),
+        ranking_rules_builder: |_, _| Vec::default(),
         search_bucket: Vec::default(),
         search_idx: 0,
         marked_bucket: Vec::default(),
@@ -1044,12 +1130,13 @@ pub extern "C" fn amrescan(
         if let Some(query_terms) = query_terms {
             let (graph, _) =
                 QueryGraph::from_query(opaque.milli_context, &query_terms).unwrap_or_report();
-            // let ranking_rules = get_ranking_rules_for_query_graph_search(
-            //     opaque.milli_context,
-            //     &None,
-            //     milli::GeoSortStrategy::default(),
-            //     query.terms_matching_strategy,
-            // );
+            let ranking_rules = get_ranking_rules_for_query_graph_search(
+                opaque.milli_context,
+                &None,
+                milli::GeoSortStrategy::default(),
+                query.terms_matching_strategy,
+            )
+            .unwrap_or_report();
             *opaque.universe &= resolve_universe(
                 opaque.milli_context,
                 opaque.universe,
@@ -1057,9 +1144,12 @@ pub extern "C" fn amrescan(
                 query.terms_matching_strategy,
                 &mut milli::DefaultSearchLogger,
             )
-            .unwrap();
+            .unwrap_or_report();
             *opaque.milli_query = MilliQuery::Graph(graph);
-            // *opaque.ranking_rules = ranking_rules;
+            *opaque.ranking_rules = ranking_rules
+                .into_iter()
+                .map(MilliRankingRule::Graph)
+                .collect();
         }
     });
 }
