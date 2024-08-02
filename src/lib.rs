@@ -898,16 +898,29 @@ struct ScanOpaque {
     #[borrows(milli_index, lmdb_rtxn)]
     #[not_covariant]
     milli_context: milli::SearchContext<'this>,
-    // Keep a universe for usage in amgetbitmap
+    // Document ID to TID lookup utilities
+    #[borrows(milli_index, lmdb_rtxn)]
+    milli_index_fields: milli::FieldsIdsMap,
+    #[borrows(milli_index_fields)]
+    #[covariant]
+    milli_primary_key: milli::documents::PrimaryKey<'this>,
+    // Whether we need to sort during amgettuple, or if Postgres just wants unordered TIDs
+    ranking_enabled: bool,
+    // Keep a universe of unordered search results
     universe: RoaringBitmap,
+    // If ranking is disabled, for amgettuple (sequential index scan), use a universe iterator
+    universe_iter: Option<roaring::bitmap::IntoIter>,
+    last_document_id: Option<milli::DocumentId>,
+    // If ranking is enabled, we need additional ranking-related state:
     // Some useful state for scanning produced during universe contruction
     #[borrows(lmdb_rtxn)]
     #[not_covariant]
     milli_query: MilliQuery<'this>,
     terms_matching_strategy: milli::TermsMatchingStrategy,
     scoring_strategy: milli::score_details::ScoringStrategy,
-    // Batch up stashed search results in a Vec
-    batch_size: usize,
+    // Bucket sort based on ranking rules will return a Vec based on a start and end range
+    // Stash bucket sort results for use in amgettuple
+    stash_size: usize,
     search_stash: Vec<milli::DocumentId>,
     search_idx: Option<usize>,
     // Storage for ammarkpos and amrestrpos
@@ -942,12 +955,21 @@ pub extern "C" fn ambeginscan(
         milli_context_builder: |milli_index, lmdb_rtxn| {
             milli::SearchContext::new(milli_index, lmdb_rtxn).unwrap_or_report()
         },
+        milli_index_fields_builder: |milli_index, lmdb_rtxn| {
+            milli_index.fields_ids_map(lmdb_rtxn).unwrap_or_report()
+        },
+        milli_primary_key_builder: |milli_index_fields| {
+            milli::documents::PrimaryKey::new(TID_PRIMARY_KEY, milli_index_fields).unwrap()
+        },
+        ranking_enabled: false,
         // Empty universe, to be filled by amrescan
         universe: RoaringBitmap::new(),
+        universe_iter: None,
+        last_document_id: None,
         milli_query_builder: |_| MilliQuery::Placeholder(PlaceholderQuery, Vec::new()),
         terms_matching_strategy: milli::TermsMatchingStrategy::default(),
         scoring_strategy: milli::score_details::ScoringStrategy::default(),
-        batch_size: DEFAULT_SCAN_BATCH_SIZE,
+        stash_size: DEFAULT_SCAN_BATCH_SIZE,
         search_stash: Vec::default(),
         search_idx: None,
         marked_stash: Vec::default(),
@@ -1000,46 +1022,48 @@ pub extern "C" fn amrescan(
     let natts = desc.natts as usize;
     let attrs = unsafe { desc.attrs.as_slice(natts) };
 
-    // Need to restart scan with new values; limit universe and apply settings
-    let keys = if keys.is_null() {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(keys, nkeys as usize) }
-    };
-    let orderbys = if orderbys.is_null() {
-        &[]
-    } else {
-        unsafe { slice::from_raw_parts(orderbys, norderbys as usize) }
-    };
-    info!("{keys:?},{orderbys:?}");
-
-    // Gather queries on columns
-    let mut queries: Vec<(PgmumboQuery, HashSet<&str>)> = keys
-        .iter()
-        .chain(orderbys)
-        .map(|scan_key| {
-            let att_idx = (scan_key.sk_attno - 1) as usize;
-            let att_name = unsafe { CStr::from_ptr(attrs[att_idx].attname.data.as_ptr()) }
-                .to_str()
-                .unwrap_or_report();
-            let argument = unsafe {
-                PgmumboQuery::from_datum(scan_key.sk_argument, scan_key.sk_argument.is_null())
-            }
-            .unwrap();
-            (argument, att_name)
-        })
-        .chunk_by(|x| x.0.clone())
-        .into_iter()
-        .map(|(k, v)| (k, v.map(|(_, v)| v).collect::<HashSet<&str>>()))
-        .collect();
-    // Produce the final PgmumboQuery
-    if queries.len() != 1 {
-        error!("pgmumbo does not currently support dissimilar queries on multiple columns")
-    }
-    let (query, document_keys) = queries.pop().unwrap();
-    let document_keys: Vec<String> = document_keys.into_iter().map(|x| x.to_string()).collect();
-
     opaque.with_mut(|opaque| {
+        // Need to restart scan with new values; limit universe and apply settings
+        let keys = if keys.is_null() {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(keys, nkeys as usize) }
+        };
+        let orderbys = if orderbys.is_null() {
+            &[]
+        } else {
+            // If we're processing an ORDER BY clause, then sorting using ranking rules must be enabled
+            *opaque.ranking_enabled = true;
+            unsafe { slice::from_raw_parts(orderbys, norderbys as usize) }
+        };
+        info!("{keys:?},{orderbys:?}");
+
+        // Gather queries on columns
+        let mut queries: Vec<(PgmumboQuery, HashSet<&str>)> = keys
+            .iter()
+            .chain(orderbys)
+            .map(|scan_key| {
+                let att_idx = (scan_key.sk_attno - 1) as usize;
+                let att_name = unsafe { CStr::from_ptr(attrs[att_idx].attname.data.as_ptr()) }
+                    .to_str()
+                    .unwrap_or_report();
+                let argument = unsafe {
+                    PgmumboQuery::from_datum(scan_key.sk_argument, scan_key.sk_argument.is_null())
+                }
+                .unwrap();
+                (argument, att_name)
+            })
+            .chunk_by(|x| x.0.clone())
+            .into_iter()
+            .map(|(k, v)| (k, v.map(|(_, v)| v).collect::<HashSet<&str>>()))
+            .collect();
+        // Produce the final PgmumboQuery
+        if queries.len() != 1 {
+            error!("pgmumbo does not currently support dissimilar queries on multiple columns")
+        }
+        let (query, document_keys) = queries.pop().unwrap();
+        let document_keys: Vec<String> = document_keys.into_iter().map(|x| x.to_string()).collect();
+
         *opaque.universe = opaque.milli_index.documents_ids(opaque.lmdb_rtxn).unwrap();
         opaque
             .milli_context
@@ -1097,84 +1121,93 @@ pub extern "C" fn amgettuple(
 
     let documents_remain = false;
 
-    // TODO: check specifics of lifetime aliasing issue
+    opaque.with_mut(|opaque| {
+        if *opaque.ranking_enabled {
+            macro_rules! bucket_sort {
+                ($start:expr, $end:expr) => {{
+                    // Consequence of trait types
+                    match opaque.milli_query {
+                        MilliQuery::Graph(query, ranking_rules) => {
+                            milli::search::new::bucket_sort::bucket_sort(
+                                opaque.milli_context,
+                                ranking_rules,
+                                query,
+                                None,
+                                opaque.universe,
+                                $start,
+                                $end,
+                                *opaque.scoring_strategy,
+                                &mut DefaultSearchLogger,
+                                milli::TimeBudget::max(),
+                                None,
+                            )
+                        }
+                        MilliQuery::Placeholder(query, ranking_rules) => {
+                            milli::search::new::bucket_sort::bucket_sort(
+                                opaque.milli_context,
+                                ranking_rules,
+                                query,
+                                None,
+                                opaque.universe,
+                                $start,
+                                $end,
+                                *opaque.scoring_strategy,
+                                &mut DefaultSearchLogger,
+                                milli::TimeBudget::max(),
+                                None,
+                            )
+                        }
+                    }
+                    .unwrap_or_report()
+                }};
+            }
+            macro_rules! get_tid {
+                ($document_id:expr) => {{
+                    let (_, document) = opaque
+                        .milli_index
+                        .documents(opaque.lmdb_rtxn, iter::once($document_id))
+                        .unwrap()
+                        .into_iter()
+                        .next()
+                        .unwrap();
+                    let pk_value = opaque
+                        .milli_primary_key
+                        .document_id(&document, opaque.milli_index_fields)
+                        .unwrap_or_report()
+                        .map_err(|_| todo!())
+                        .unwrap();
+                    name_to_tid(&pk_value).unwrap_or_report()
+                }};
+            }
 
-    // opaque.with_mut(|opaque| {
-    //     // Set up TID lookup tools
-    //     let milli_index_fields = opaque
-    //         .milli_index
-    //         .fields_ids_map(opaque.lmdb_rtxn)
-    //         .unwrap_or_report();
-    //     let milli_primary_key =
-    //         milli::documents::PrimaryKey::new(TID_PRIMARY_KEY, &milli_index_fields).unwrap();
-    //     macro_rules! get_tid {
-    //         ($document_id:expr) => {{
-    //             let (_, document) = opaque
-    //                 .milli_index
-    //                 .documents(opaque.lmdb_rtxn, iter::once($document_id))
-    //                 .unwrap()
-    //                 .into_iter()
-    //                 .next()
-    //                 .unwrap();
-    //             let pk_value = milli_primary_key
-    //                 .document_id(&document, &milli_index_fields)
-    //                 .unwrap_or_report()
-    //                 .map_err(|_| todo!())
-    //                 .unwrap();
-    //             name_to_tid(&pk_value).unwrap_or_report()
-    //         }};
-    //     }
-
-    //     // Check if we have a stash already...
-    //     if let Some(search_idx) = opaque.search_idx {
-    //         match direction {
-    //             pg_sys::ScanDirection::ForwardScanDirection => {}
-    //             pg_sys::ScanDirection::NoMovementScanDirection => {
-    //                 // We know that the stash is already initialized, so let's just grab it
-    //                 let stash_idx = *search_idx % *opaque.batch_size;
-    //                 let document_id = opaque.search_stash[stash_idx];
-    //                 scan.xs_heaptid = get_tid!(document_id);
-    //             }
-    //             _ => error!("Unsupported scan direction: {direction}"),
-    //         };
-    //     } else {
-    //         // if not, then we'll have to initialize the stash
-    //         let bucket_result = match opaque.milli_query {
-    //             MilliQuery::Graph(query, ranking_rules) => {
-    //                 milli::search::new::bucket_sort::bucket_sort(
-    //                     opaque.milli_context,
-    //                     ranking_rules,
-    //                     query,
-    //                     None,
-    //                     opaque.universe,
-    //                     0,
-    //                     0,
-    //                     *opaque.scoring_strategy,
-    //                     &mut DefaultSearchLogger,
-    //                     milli::TimeBudget::max(),
-    //                     None,
-    //                 )
-    //             }
-    //             MilliQuery::Placeholder(query, ranking_rules) => {
-    //                 milli::search::new::bucket_sort::bucket_sort(
-    //                     opaque.milli_context,
-    //                     ranking_rules,
-    //                     query,
-    //                     None,
-    //                     opaque.universe,
-    //                     0,
-    //                     0,
-    //                     *opaque.scoring_strategy,
-    //                     &mut DefaultSearchLogger,
-    //                     milli::TimeBudget::max(),
-    //                     None,
-    //                 )
-    //             }
-    //         }
-    //         .unwrap_or_report();
-    //         *opaque.search_stash = bucket_result.docids;
-    //     }
-    // });
+            // Check if we have a stash already...
+            if let Some(search_idx) = opaque.search_idx {
+                // We have a stash, perform the scan
+                match direction {
+                    pg_sys::ScanDirection::ForwardScanDirection => {
+                        // Check whether a forward direction is outside the range of our stash
+                    }
+                    pg_sys::ScanDirection::NoMovementScanDirection => {
+                        // We know that the stash is already initialized, so let's just grab it
+                        let stash_idx = *search_idx % *opaque.stash_size;
+                        let document_id = opaque.search_stash[stash_idx];
+                        scan.xs_heaptid = get_tid!(document_id);
+                    }
+                    _ => error!("Unsupported scan direction: {direction}"),
+                };
+            } else {
+                // If not, then we'll have to initialize the stash
+                // let bucket_result = bucket_sort!(0, *opaque.stash_size);
+                // *opaque.search_stash = bucket_result.docids;
+            }
+        } else {
+            // If there is no need to sort, just return the next tuple in the universe
+            if opaque.universe_iter.is_none() {
+                // The universe iterator hasn't been initialized yet
+                *opaque.universe_iter = Some(opaque.universe.clone().into_iter());
+            }
+        }
+    });
 
     documents_remain
 }
