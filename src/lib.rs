@@ -19,9 +19,7 @@ use milli::{
     documents::{documents_batch_reader_from_objects, DocumentsBatchBuilder, DocumentsBatchReader},
     get_ranking_rules_for_placeholder_search, get_ranking_rules_for_query_graph_search, heed,
     query_graph::QueryGraph,
-    ranking_rules::{
-        BoxRankingRule, PlaceholderQuery, RankingRule, RankingRuleOutput, RankingRuleQueryTrait,
-    },
+    ranking_rules::{BoxRankingRule, PlaceholderQuery},
     resolve_query_terms, resolve_universe, DefaultSearchLogger,
 };
 use pg_sys::{object_access_hook_type, panic::ErrorReportable, ObjectAccessDrop};
@@ -896,7 +894,7 @@ struct ScanOpaque {
     lmdb_rtxn: heed::RoTxn<'this>,
     // Search context
     #[borrows(milli_index, lmdb_rtxn)]
-    #[not_covariant]
+    #[covariant]
     milli_context: milli::SearchContext<'this>,
     // Document ID to TID lookup utilities
     #[borrows(milli_index, lmdb_rtxn)]
@@ -1110,6 +1108,44 @@ pub extern "C" fn amrescan(
     });
 }
 
+macro_rules! bucket_sort {
+    ($ctx:expr,$query:expr, $universe:expr, $from:expr, $length:expr, $scoring_strategy:expr) => {{
+        match $query {
+            MilliQuery::Graph(query, ranking_rules) => {
+                milli::search::new::bucket_sort::bucket_sort(
+                    $ctx,
+                    ranking_rules,
+                    query,
+                    None,
+                    $universe,
+                    $from,
+                    $length,
+                    $scoring_strategy,
+                    &mut DefaultSearchLogger,
+                    milli::TimeBudget::max(),
+                    None,
+                )
+            }
+            MilliQuery::Placeholder(query, ranking_rules) => {
+                milli::search::new::bucket_sort::bucket_sort(
+                    $ctx,
+                    ranking_rules,
+                    query,
+                    None,
+                    $universe,
+                    $from,
+                    $length,
+                    $scoring_strategy,
+                    &mut DefaultSearchLogger,
+                    milli::TimeBudget::max(),
+                    None,
+                )
+            }
+        }
+        .unwrap_or_report()
+    }};
+}
+
 #[pg_guard]
 pub extern "C" fn amgettuple(
     scan: pg_sys::IndexScanDesc,
@@ -1121,93 +1157,64 @@ pub extern "C" fn amgettuple(
 
     let documents_remain = false;
 
-    opaque.with_mut(|opaque| {
-        if *opaque.ranking_enabled {
-            macro_rules! bucket_sort {
-                ($start:expr, $end:expr) => {{
-                    // Consequence of trait types
-                    match opaque.milli_query {
-                        MilliQuery::Graph(query, ranking_rules) => {
-                            milli::search::new::bucket_sort::bucket_sort(
-                                opaque.milli_context,
-                                ranking_rules,
-                                query,
-                                None,
-                                opaque.universe,
-                                $start,
-                                $end,
-                                *opaque.scoring_strategy,
-                                &mut DefaultSearchLogger,
-                                milli::TimeBudget::max(),
-                                None,
-                            )
-                        }
-                        MilliQuery::Placeholder(query, ranking_rules) => {
-                            milli::search::new::bucket_sort::bucket_sort(
-                                opaque.milli_context,
-                                ranking_rules,
-                                query,
-                                None,
-                                opaque.universe,
-                                $start,
-                                $end,
-                                *opaque.scoring_strategy,
-                                &mut DefaultSearchLogger,
-                                milli::TimeBudget::max(),
-                                None,
-                            )
-                        }
-                    }
+    if *opaque.borrow_ranking_enabled() {
+        macro_rules! get_tid {
+            ($document_id:expr) => {{
+                let (_, document) = opaque
+                    .borrow_milli_index()
+                    .documents(opaque.borrow_lmdb_rtxn(), iter::once($document_id))
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .unwrap();
+                let pk_value = opaque
+                    .borrow_milli_primary_key()
+                    .document_id(&document, opaque.borrow_milli_index_fields())
                     .unwrap_or_report()
-                }};
-            }
-            macro_rules! get_tid {
-                ($document_id:expr) => {{
-                    let (_, document) = opaque
-                        .milli_index
-                        .documents(opaque.lmdb_rtxn, iter::once($document_id))
-                        .unwrap()
-                        .into_iter()
-                        .next()
-                        .unwrap();
-                    let pk_value = opaque
-                        .milli_primary_key
-                        .document_id(&document, opaque.milli_index_fields)
-                        .unwrap_or_report()
-                        .map_err(|_| todo!())
-                        .unwrap();
-                    name_to_tid(&pk_value).unwrap_or_report()
-                }};
-            }
-
-            // Check if we have a stash already...
-            if let Some(search_idx) = opaque.search_idx {
-                // We have a stash, perform the scan
-                match direction {
-                    pg_sys::ScanDirection::ForwardScanDirection => {
-                        // Check whether a forward direction is outside the range of our stash
-                    }
-                    pg_sys::ScanDirection::NoMovementScanDirection => {
-                        // We know that the stash is already initialized, so let's just grab it
-                        let stash_idx = *search_idx % *opaque.stash_size;
-                        let document_id = opaque.search_stash[stash_idx];
-                        scan.xs_heaptid = get_tid!(document_id);
-                    }
-                    _ => error!("Unsupported scan direction: {direction}"),
-                };
-            } else {
-                // If not, then we'll have to initialize the stash
-                // let bucket_result = bucket_sort!(0, *opaque.stash_size);
-                // *opaque.search_stash = bucket_result.docids;
-            }
-        } else {
-            // If there is no need to sort, just return the next tuple in the universe
-            if opaque.universe_iter.is_none() {
-                // The universe iterator hasn't been initialized yet
-                *opaque.universe_iter = Some(opaque.universe.clone().into_iter());
-            }
+                    .map_err(|_| todo!())
+                    .unwrap();
+                name_to_tid(&pk_value).unwrap_or_report()
+            }};
         }
-    });
+
+        // Check if we have a stash already...
+        if let Some(search_idx) = opaque.borrow_search_idx() {
+            // We have a stash, perform the scan
+            match direction {
+                pg_sys::ScanDirection::ForwardScanDirection => {
+                    // Check whether a forward direction is outside the range of our stash
+                }
+                pg_sys::ScanDirection::NoMovementScanDirection => {
+                    // We know that the stash is already initialized, so let's just grab it
+                    let stash_idx = *search_idx % *opaque.borrow_stash_size();
+                    let document_id = opaque.borrow_search_stash()[stash_idx];
+                    scan.xs_heaptid = get_tid!(document_id);
+                }
+                _ => error!("Unsupported scan direction: {direction}"),
+            };
+        } else {
+            // If not, then we'll have to initialize the stash
+            opaque.with_mut(|opaque| {
+                let bucket_result = bucket_sort!(
+                    opaque.milli_context,
+                    opaque.milli_query,
+                    opaque.universe,
+                    0, // Start from the top result
+                    *opaque.stash_size,
+                    *opaque.scoring_strategy
+                );
+                *opaque.search_stash = bucket_result.docids;
+            })
+        }
+    } else {
+        // If there is no need to sort, just return the next tuple in the universe
+        if opaque.borrow_universe_iter().is_none() {
+            // The universe iterator hasn't been initialized yet
+            opaque.with_mut(|opaque| {
+                *opaque.universe_iter = Some(opaque.universe.clone().into_iter());
+            });
+        }
+    }
 
     documents_remain
 }

@@ -26,7 +26,8 @@ serde_json = "1"
 thiserror = "1.0"
 ciborium = "0.2"
 serde_nested_with = "0.2.5"
-ouroboros = "0.18"
+# not 0.18, b/c potentially pending https://github.com/someguynamedjosh/ouroboros/pull/119
+ouroboros = "0.17"
 roaring = "0.10.6"
 itertools = "0.13.0"
 
