@@ -22,7 +22,7 @@ use milli::{
     ranking_rules::{BoxRankingRule, PlaceholderQuery},
     resolve_query_terms, resolve_universe, DefaultSearchLogger,
 };
-use pg_sys::{object_access_hook_type, panic::ErrorReportable, ObjectAccessDrop};
+use pg_sys::{object_access_hook_type, panic::ErrorReportable, ItemPointerData, ObjectAccessDrop};
 use pgrx::{datum, memcx, prelude::*, vardata_4b, varsize_4b, PgMemoryContexts, PgRelation};
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
@@ -229,7 +229,7 @@ fn amhandler(_fcinfo: pg_sys::FunctionCallInfo) -> PgBox<pg_sys::IndexAmRoutine>
     amroutine.amvalidate = Some(amvalidate);
     amroutine.amadjustmembers = None;
     amroutine.ambeginscan = Some(ambeginscan);
-    amroutine.amrescan = None; // Some(amrescan);
+    amroutine.amrescan = Some(amrescan);
     amroutine.amgettuple = Some(amgettuple);
     amroutine.amgetbitmap = Some(amgetbitmap);
     amroutine.amendscan = Some(amendscan);
@@ -842,6 +842,8 @@ fn pgmumboquery_cmpfunc(
 ) -> bool {
     // It doesnt make sense to compare against things that aren't column attribute numbers
     error!("{PROGRAM_NAME} cmpfunc not valid on unindexed column");
+    // info!("{PROGRAM_NAME}: cmpfunc");
+    // true
 }
 
 #[pg_extern(immutable, parallel_safe)]
@@ -1022,6 +1024,7 @@ pub extern "C" fn amrescan(
 
     opaque.with_mut(|opaque| {
         // Need to restart scan with new values; limit universe and apply settings
+        // TODO review semantics of null pointers and _re_scans
         let keys = if keys.is_null() {
             &[]
         } else {
@@ -1031,10 +1034,13 @@ pub extern "C" fn amrescan(
             &[]
         } else {
             // If we're processing an ORDER BY clause, then sorting using ranking rules must be enabled
-            *opaque.ranking_enabled = true;
             unsafe { slice::from_raw_parts(orderbys, norderbys as usize) }
         };
         info!("{keys:?},{orderbys:?}");
+        if norderbys > 0 {
+            info!("Turning on ranking");
+            *opaque.ranking_enabled = true;
+        }
 
         // Gather queries on columns
         let mut queries: Vec<(PgmumboQuery, HashSet<&str>)> = keys
@@ -1108,6 +1114,7 @@ pub extern "C" fn amrescan(
     });
 }
 
+// Goofy macro to demux potential trait types from the enum + some defaults
 macro_rules! bucket_sort {
     ($ctx:expr,$query:expr, $universe:expr, $from:expr, $length:expr, $scoring_strategy:expr) => {{
         match $query {
@@ -1146,6 +1153,27 @@ macro_rules! bucket_sort {
     }};
 }
 
+fn get_one_tid(
+    index: &milli::Index,
+    txn: &heed::RoTxn,
+    pk: &milli::documents::PrimaryKey<'_>,
+    fields: &milli::FieldsIdsMap,
+    document_id: u32,
+) -> ItemPointerData {
+    let (_, document) = index
+        .documents(txn, iter::once(document_id))
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let pk_value = pk
+        .document_id(&document, fields)
+        .unwrap_or_report()
+        .map_err(|_| todo!())
+        .unwrap();
+    name_to_tid(&pk_value).unwrap_or_report()
+}
+
 #[pg_guard]
 pub extern "C" fn amgettuple(
     scan: pg_sys::IndexScanDesc,
@@ -1155,28 +1183,9 @@ pub extern "C" fn amgettuple(
     let mut scan = unsafe { PgBox::from_pg(scan) };
     let mut opaque = unsafe { PgBox::from_pg(scan.opaque as *mut ScanOpaque) };
 
-    let documents_remain = false;
-
+    let mut documents_remain = false;
     if *opaque.borrow_ranking_enabled() {
-        macro_rules! get_tid {
-            ($document_id:expr) => {{
-                let (_, document) = opaque
-                    .borrow_milli_index()
-                    .documents(opaque.borrow_lmdb_rtxn(), iter::once($document_id))
-                    .unwrap()
-                    .into_iter()
-                    .next()
-                    .unwrap();
-                let pk_value = opaque
-                    .borrow_milli_primary_key()
-                    .document_id(&document, opaque.borrow_milli_index_fields())
-                    .unwrap_or_report()
-                    .map_err(|_| todo!())
-                    .unwrap();
-                name_to_tid(&pk_value).unwrap_or_report()
-            }};
-        }
-
+        info!("{PROGRAM_NAME} ranking enabled");
         // Check if we have a stash already...
         if let Some(search_idx) = opaque.borrow_search_idx() {
             // We have a stash, perform the scan
@@ -1188,7 +1197,13 @@ pub extern "C" fn amgettuple(
                     // We know that the stash is already initialized, so let's just grab it
                     let stash_idx = *search_idx % *opaque.borrow_stash_size();
                     let document_id = opaque.borrow_search_stash()[stash_idx];
-                    scan.xs_heaptid = get_tid!(document_id);
+                    scan.xs_heaptid = get_one_tid(
+                        opaque.borrow_milli_index(),
+                        opaque.borrow_lmdb_rtxn(),
+                        opaque.borrow_milli_primary_key(),
+                        opaque.borrow_milli_index_fields(),
+                        document_id,
+                    )
                 }
                 _ => error!("Unsupported scan direction: {direction}"),
             };
@@ -1207,15 +1222,58 @@ pub extern "C" fn amgettuple(
             })
         }
     } else {
+        info!("{PROGRAM_NAME} ranking disabled");
         // If there is no need to sort, just return the next tuple in the universe
         if opaque.borrow_universe_iter().is_none() {
+            info!("{PROGRAM_NAME} init uniiter");
             // The universe iterator hasn't been initialized yet
             opaque.with_mut(|opaque| {
                 *opaque.universe_iter = Some(opaque.universe.clone().into_iter());
             });
         }
+        match direction {
+            pg_sys::ScanDirection::ForwardScanDirection => {
+                info!("{PROGRAM_NAME} forward scan");
+                opaque.with_mut(|opaque| {
+                    if let Some(universe_iter) = opaque.universe_iter {
+                        let document_id_result = universe_iter.next();
+                        *opaque.last_document_id = document_id_result;
+                        if let Some(document_id) = document_id_result {
+                            info!("{PROGRAM_NAME} forward scan... save");
+                            scan.xs_heaptid = get_one_tid(
+                                opaque.milli_index,
+                                opaque.lmdb_rtxn,
+                                opaque.milli_primary_key,
+                                opaque.milli_index_fields,
+                                document_id,
+                            );
+                            scan.xs_recheck = false;
+                            info!("{PROGRAM_NAME} scanret: {:?}", scan.xs_heaptid);
+                            documents_remain = true;
+                        }
+                    } else {
+                        panic!();
+                    }
+                });
+            }
+            pg_sys::ScanDirection::NoMovementScanDirection => {
+                info!("{PROGRAM_NAME} no movement scan");
+                if let Some(document_id) = opaque.borrow_last_document_id() {
+                    scan.xs_heaptid = get_one_tid(
+                        opaque.borrow_milli_index(),
+                        opaque.borrow_lmdb_rtxn(),
+                        opaque.borrow_milli_primary_key(),
+                        opaque.borrow_milli_index_fields(),
+                        *document_id,
+                    );
+                    scan.xs_recheck = false;
+                    documents_remain = true;
+                }
+            }
+            _ => error!("Unsupported scan direction: {direction}"),
+        };
     }
-
+    info!("{PROGRAM_NAME} documents remain: {documents_remain}");
     documents_remain
 }
 
